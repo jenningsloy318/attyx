@@ -1,10 +1,35 @@
 const std = @import("std");
 
+/// Terminal color (the 8 standard ANSI colors + default).
+///
+/// Maps directly to SGR codes:
+///   fg 30–37  →  black..white
+///   bg 40–47  →  black..white
+///   39 / 49   →  default
+pub const Color = enum(u8) {
+    default = 0,
+    black,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+};
+
+/// Visual attributes attached to each cell.
+pub const Style = struct {
+    fg: Color = .default,
+    bg: Color = .default,
+    bold: bool = false,
+    underline: bool = false,
+};
+
 /// A single cell in the terminal grid.
-/// For now, stores just an ASCII character byte.
-/// Will grow to include color/style attributes in later milestones.
 pub const Cell = struct {
     char: u8 = ' ',
+    style: Style = .{},
 };
 
 /// Fixed-size 2D grid of cells, stored as a flat row-major array.
@@ -39,7 +64,7 @@ pub const Grid = struct {
         self.cells[row * self.cols + col] = cell;
     }
 
-    /// Reset every cell in the given row to default (space).
+    /// Reset every cell in the given row to default (space + default style).
     pub fn clearRow(self: *Grid, row: usize) void {
         const start = row * self.cols;
         @memset(self.cells[start .. start + self.cols], Cell{});
@@ -110,4 +135,16 @@ test "scrollUp shifts rows and clears bottom" {
     try std.testing.expectEqual(@as(u8, 'B'), g.getCell(0, 0).char);
     try std.testing.expectEqual(@as(u8, 'C'), g.getCell(1, 0).char);
     try std.testing.expectEqual(@as(u8, ' '), g.getCell(2, 0).char);
+}
+
+test "new cells have default style" {
+    const alloc = std.testing.allocator;
+    var g = try Grid.init(alloc, 1, 1);
+    defer g.deinit();
+
+    const cell = g.getCell(0, 0);
+    try std.testing.expectEqual(Color.default, cell.style.fg);
+    try std.testing.expectEqual(Color.default, cell.style.bg);
+    try std.testing.expect(!cell.style.bold);
+    try std.testing.expect(!cell.style.underline);
 }

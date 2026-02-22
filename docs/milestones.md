@@ -6,7 +6,7 @@
 |---|-----------|--------|
 | 1 | Headless terminal core (text-only) | ✅ Done |
 | 2 | Action stream + parser skeleton | ✅ Done |
-| 3 | Minimal CSI support | Planned |
+| 3 | Minimal CSI support (cursor, erase, SGR) | ✅ Done |
 | 4 | Scroll + scrollback | Planned |
 | 5 | Alternate screen | Planned |
 | 6 | Damage tracking | Planned |
@@ -92,3 +92,63 @@ where ESC is always at least a two-byte sequence.
 
 **Tests added:** 20 new (48 total). Covers parser unit tests, ESC/CSI golden
 tests, and incremental chunk-splitting tests.
+
+---
+
+## Milestone 3: Minimal CSI Semantics
+
+**Goal:** CSI sequences actually do things. Extend the parser to produce
+structured actions with parsed parameters, and implement them in the state.
+
+**What was built:**
+
+- `Color` enum (8 standard ANSI colors + default).
+- `Style` struct (fg, bg, bold, underline) attached to every `Cell`.
+- The "pen" — current text attributes in `TerminalState`, stamped onto every printed cell.
+- CSI parameter parsing: `"31;1"` → `[31, 1]`. Handles semicolons, missing params, overflow.
+- Structured CSI dispatch in the parser for 5 CSI command types.
+- State implementation for all 5 CSI commands.
+
+**Supported CSI sequences:**
+
+| Sequence | Name | Behavior |
+|----------|------|----------|
+| `ESC[{r};{c}H` | CUP (Cursor Position) | Move cursor to absolute position (1-based, default 1;1) |
+| `ESC[{r};{c}f` | HVP | Same as CUP |
+| `ESC[{n}A` | CUU (Cursor Up) | Move cursor up by n (default 1), clamp at row 0 |
+| `ESC[{n}B` | CUD (Cursor Down) | Move cursor down by n, clamp at last row |
+| `ESC[{n}C` | CUF (Cursor Forward) | Move cursor right by n, clamp at last col |
+| `ESC[{n}D` | CUB (Cursor Back) | Move cursor left by n, clamp at col 0 |
+| `ESC[{n}J` | ED (Erase in Display) | 0: cursor→end, 1: start→cursor, 2: all |
+| `ESC[{n}K` | EL (Erase in Line) | 0: cursor→EOL, 1: BOL→cursor, 2: full line |
+| `ESC[{...}m` | SGR (Select Graphic Rendition) | See below |
+
+**SGR codes supported:**
+
+| Code | Effect |
+|------|--------|
+| 0 | Reset all attributes |
+| 1 | Bold |
+| 4 | Underline |
+| 30–37 | Set foreground (black, red, green, yellow, blue, magenta, cyan, white) |
+| 39 | Reset foreground to default |
+| 40–47 | Set background (same 8 colors) |
+| 49 | Reset background to default |
+
+**New Action variants:**
+
+```zig
+cursor_abs: CursorAbs,    // CSI H / f
+cursor_rel: CursorRel,    // CSI A/B/C/D
+erase_display: EraseMode,  // CSI J
+erase_line: EraseMode,     // CSI K
+sgr: Sgr,                  // CSI m
+```
+
+**Data model change:** `Cell` now stores `Style` alongside `char`. Snapshot
+format remains text-only (characters only) — style is verified through
+programmatic attribute tests.
+
+**Tests added:** 33 new (81 total). Includes golden snapshot tests for all
+CSI commands, SGR attribute tests (direct cell inspection), and incremental
+parsing tests for CSI with parameters split across chunks.

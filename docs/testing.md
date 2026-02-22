@@ -57,15 +57,28 @@ fn expectSnapshot(rows, cols, input, expected) !void
 fn expectChunkedSnapshot(rows, cols, chunks, expected) !void
 ```
 
+### Attribute tests (`headless/tests.zig`)
+
+SGR tests cannot rely on snapshots (snapshots are text-only, no style info).
+Instead, these tests create an `Engine`, feed input, and inspect `Cell.style`
+directly:
+
+```zig
+var engine = try Engine.init(alloc, 2, 10);
+engine.feed("\x1b[31mA\x1b[0mB");
+try expectEqual(Color.red, engine.state.grid.getCell(0, 0).style.fg);
+try expectEqual(Color.default, engine.state.grid.getCell(0, 1).style.fg);
+```
+
 ## Current Test Count
 
 | Module | Tests |
 |--------|-------|
-| grid.zig | 4 |
-| parser.zig | 10 |
-| state.zig | 6 |
+| grid.zig | 5 |
+| parser.zig | 18 |
+| state.zig | 7 |
 | snapshot.zig | 2 |
 | engine.zig | 1 |
 | runner.zig | 2 |
-| tests.zig (golden) | 23 |
-| **Total** | **48** |
+| tests.zig (golden + attr) | 46 |
+| **Total** | **81** |

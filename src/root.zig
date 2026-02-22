@@ -12,8 +12,13 @@ pub const engine = @import("term/engine.zig");
 
 pub const Action = actions.Action;
 pub const ControlCode = actions.ControlCode;
+pub const Direction = actions.Direction;
+pub const EraseMode = actions.EraseMode;
+pub const Sgr = actions.Sgr;
 pub const Cell = grid.Cell;
 pub const Grid = grid.Grid;
+pub const Color = grid.Color;
+pub const Style = grid.Style;
 pub const Parser = parser.Parser;
 pub const TerminalState = state.TerminalState;
 pub const Cursor = state.Cursor;

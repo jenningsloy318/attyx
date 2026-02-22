@@ -4,6 +4,8 @@ const actions_mod = @import("actions.zig");
 
 pub const Grid = grid_mod.Grid;
 pub const Cell = grid_mod.Cell;
+pub const Color = grid_mod.Color;
+pub const Style = grid_mod.Style;
 pub const Action = actions_mod.Action;
 pub const ControlCode = actions_mod.ControlCode;
 
@@ -15,6 +17,8 @@ pub const Cursor = struct {
 pub const TerminalState = struct {
     grid: Grid,
     cursor: Cursor = .{},
+    /// The "pen" — current text attributes applied to every newly printed cell.
+    pen: Style = .{},
 
     pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !TerminalState {
         return .{
@@ -27,8 +31,6 @@ pub const TerminalState = struct {
     }
 
     /// Apply a single Action to the terminal state.
-    /// This is the ONLY way state changes — the parser produces Actions,
-    /// and this method executes them.
     pub fn apply(self: *TerminalState, action: Action) void {
         switch (action) {
             .print => |byte| self.printChar(byte),
@@ -39,17 +41,29 @@ pub const TerminalState = struct {
                 .tab => self.tab(),
             },
             .nop => {},
+            .cursor_abs => |abs| self.cursorAbsolute(abs),
+            .cursor_rel => |rel| self.cursorRelative(rel),
+            .erase_display => |mode| self.eraseInDisplay(mode),
+            .erase_line => |mode| self.eraseInLine(mode),
+            .sgr => |sgr| self.applySgr(sgr),
         }
     }
 
+    // -- Text output -------------------------------------------------------
+
     fn printChar(self: *TerminalState, char: u8) void {
-        self.grid.setCell(self.cursor.row, self.cursor.col, .{ .char = char });
+        self.grid.setCell(self.cursor.row, self.cursor.col, .{
+            .char = char,
+            .style = self.pen,
+        });
         self.cursor.col += 1;
         if (self.cursor.col >= self.grid.cols) {
             self.cursor.col = 0;
             self.cursorDown();
         }
     }
+
+    // -- C0 control characters ---------------------------------------------
 
     fn lineFeed(self: *TerminalState) void {
         self.cursorDown();
@@ -77,10 +91,79 @@ pub const TerminalState = struct {
             self.cursor.row = self.grid.rows - 1;
         }
     }
+
+    // -- CSI cursor positioning --------------------------------------------
+
+    fn cursorAbsolute(self: *TerminalState, abs: actions_mod.CursorAbs) void {
+        self.cursor.row = @min(@as(usize, abs.row), self.grid.rows - 1);
+        self.cursor.col = @min(@as(usize, abs.col), self.grid.cols - 1);
+    }
+
+    fn cursorRelative(self: *TerminalState, rel: actions_mod.CursorRel) void {
+        const n: usize = @intCast(rel.n);
+        switch (rel.dir) {
+            .up => self.cursor.row -|= n,
+            .down => self.cursor.row = @min(self.cursor.row +| n, self.grid.rows - 1),
+            .right => self.cursor.col = @min(self.cursor.col +| n, self.grid.cols - 1),
+            .left => self.cursor.col -|= n,
+        }
+    }
+
+    // -- CSI erase ---------------------------------------------------------
+
+    fn eraseInDisplay(self: *TerminalState, mode: actions_mod.EraseMode) void {
+        const cols = self.grid.cols;
+        switch (mode) {
+            .to_end => {
+                const start = self.cursor.row * cols + self.cursor.col;
+                @memset(self.grid.cells[start..], Cell{});
+            },
+            .to_start => {
+                const end = self.cursor.row * cols + self.cursor.col + 1;
+                @memset(self.grid.cells[0..end], Cell{});
+            },
+            .all => {
+                @memset(self.grid.cells, Cell{});
+            },
+        }
+    }
+
+    fn eraseInLine(self: *TerminalState, mode: actions_mod.EraseMode) void {
+        const cols = self.grid.cols;
+        const row_start = self.cursor.row * cols;
+        switch (mode) {
+            .to_end => {
+                @memset(self.grid.cells[row_start + self.cursor.col .. row_start + cols], Cell{});
+            },
+            .to_start => {
+                @memset(self.grid.cells[row_start .. row_start + self.cursor.col + 1], Cell{});
+            },
+            .all => {
+                self.grid.clearRow(self.cursor.row);
+            },
+        }
+    }
+
+    // -- CSI SGR (Select Graphic Rendition) --------------------------------
+
+    fn applySgr(self: *TerminalState, sgr: actions_mod.Sgr) void {
+        for (sgr.params[0..sgr.len]) |param| {
+            switch (param) {
+                0 => self.pen = .{},
+                1 => self.pen.bold = true,
+                4 => self.pen.underline = true,
+                30...37 => self.pen.fg = @enumFromInt(param - 29),
+                39 => self.pen.fg = .default,
+                40...47 => self.pen.bg = @enumFromInt(param - 39),
+                49 => self.pen.bg = .default,
+                else => {},
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
-// Unit tests — these exercise apply() directly, no parser involved
+// Unit tests
 // ---------------------------------------------------------------------------
 
 test "apply print writes to grid and advances cursor" {
@@ -149,4 +232,16 @@ test "apply nop has no effect" {
     try std.testing.expectEqual(row_before, t.cursor.row);
     try std.testing.expectEqual(col_before, t.cursor.col);
     try std.testing.expectEqual(@as(u8, 'X'), t.grid.getCell(0, 0).char);
+}
+
+test "printed cells carry current pen style" {
+    const alloc = std.testing.allocator;
+    var t = try TerminalState.init(alloc, 2, 4);
+    defer t.deinit();
+
+    t.pen = .{ .fg = .red, .bold = true };
+    t.apply(.{ .print = 'A' });
+    const cell = t.grid.getCell(0, 0);
+    try std.testing.expectEqual(Color.red, cell.style.fg);
+    try std.testing.expect(cell.style.bold);
 }

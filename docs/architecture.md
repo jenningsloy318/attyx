@@ -52,9 +52,14 @@ src/
 
 ```zig
 pub const Action = union(enum) {
-    print: u8,            // Write a printable ASCII byte at cursor
-    control: ControlCode, // Execute a C0 control code
-    nop,                  // Ignored byte or unsupported sequence
+    print: u8,                 // Write a printable ASCII byte at cursor
+    control: ControlCode,      // Execute a C0 control code (LF/CR/BS/TAB)
+    nop,                       // Ignored byte or unsupported sequence
+    cursor_abs: CursorAbs,     // CSI H / f — absolute cursor position
+    cursor_rel: CursorRel,     // CSI A/B/C/D — relative cursor movement
+    erase_display: EraseMode,  // CSI J — erase in display
+    erase_line: EraseMode,     // CSI K — erase in line
+    sgr: Sgr,                  // CSI m — colors, bold, underline
 };
 ```
 
@@ -71,12 +76,23 @@ Ground ──ESC──▸ Escape ──[──▸ CSI
 - `next(byte) → ?Action` — process one byte, return action or null.
 - Zero allocations. All state in fixed-size struct fields.
 - Handles partial sequences across `feed()` chunk boundaries.
+- CSI dispatch: parses parameter bytes into integers, recognizes final byte,
+  emits structured Action with parsed data (e.g., CursorAbs with row/col).
 
 ### TerminalState (`term/state.zig`)
 
-- Owns a `Grid` and a `Cursor`.
+- Owns a `Grid`, a `Cursor`, and a `pen` (current `Style`).
 - `apply(action)` — the only way state changes.
-- Private helpers: `printChar`, `lineFeed`, `carriageReturn`, `backspace`, `tab`, `cursorDown`.
+- Private helpers: `printChar`, `lineFeed`, `carriageReturn`, `backspace`,
+  `tab`, `cursorDown`, `cursorAbsolute`, `cursorRelative`, `eraseInDisplay`,
+  `eraseInLine`, `applySgr`.
+
+### Cell + Style (`term/grid.zig`)
+
+- `Color` enum: `default`, `black`, `red`, `green`, `yellow`, `blue`,
+  `magenta`, `cyan`, `white`.
+- `Style` struct: `fg: Color`, `bg: Color`, `bold: bool`, `underline: bool`.
+- `Cell` struct: `char: u8`, `style: Style`.
 
 ### Grid (`term/grid.zig`)
 

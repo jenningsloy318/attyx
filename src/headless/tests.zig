@@ -1,5 +1,7 @@
 const std = @import("std");
 const runner = @import("runner.zig");
+const Engine = @import("../term/engine.zig").Engine;
+const Color = @import("../term/grid.zig").Color;
 
 /// Helper: create a terminal, feed input, compare snapshot to expected output.
 fn expectSnapshot(rows: usize, cols: usize, input: []const u8, expected: []const u8) !void {
@@ -18,7 +20,7 @@ fn expectChunkedSnapshot(rows: usize, cols: usize, chunks: []const []const u8, e
 }
 
 // ===========================================================================
-// Basic printing (unchanged from milestone 1)
+// Basic printing (carried from milestone 1)
 // ===========================================================================
 
 test "golden: basic printing" {
@@ -35,7 +37,7 @@ test "golden: multiple characters fill left to right" {
 }
 
 // ===========================================================================
-// Line wrapping (unchanged)
+// Line wrapping (carried from milestone 1)
 // ===========================================================================
 
 test "golden: text wraps at right edge" {
@@ -51,7 +53,7 @@ test "golden: wrap triggers scroll when grid is full" {
 }
 
 // ===========================================================================
-// LF / CR (unchanged)
+// LF / CR (carried from milestone 1)
 // ===========================================================================
 
 test "golden: LF moves down, preserves column" {
@@ -75,7 +77,7 @@ test "golden: CR LF together makes a traditional newline" {
 }
 
 // ===========================================================================
-// Backspace (unchanged)
+// Backspace (carried from milestone 1)
 // ===========================================================================
 
 test "golden: backspace moves cursor left without erasing" {
@@ -91,7 +93,7 @@ test "golden: backspace clamps at column 0" {
 }
 
 // ===========================================================================
-// TAB (unchanged)
+// TAB (carried from milestone 1)
 // ===========================================================================
 
 test "golden: tab advances to next 8-column stop" {
@@ -107,7 +109,7 @@ test "golden: tab clamps at last column" {
 }
 
 // ===========================================================================
-// Scrolling (unchanged)
+// Scrolling (carried from milestone 1)
 // ===========================================================================
 
 test "golden: scroll drops top row when LF at bottom" {
@@ -124,69 +126,291 @@ test "golden: multiple scrolls" {
 }
 
 // ===========================================================================
-// Escape sequence handling (NEW in milestone 2)
+// Escape sequence framing (carried from milestone 2)
 // ===========================================================================
 
 test "golden: ESC consumes the following byte as escape sequence" {
-    // ESC + B is a two-byte escape sequence — both bytes are consumed,
-    // only 'A' before and 'C' after appear on screen.
     try expectSnapshot(2, 4, "A\x1bBC",
         "AC  \n" ++
         "    \n");
 }
 
-test "golden: CSI sequence is ignored, text after prints normally" {
-    try expectSnapshot(2, 10, "\x1b[2JHello",
-        "Hello     \n" ++
-        "          \n");
-}
-
-test "golden: CSI with params is ignored" {
-    // ESC[31m is "set foreground red" — ignored for now
-    try expectSnapshot(2, 10, "\x1b[31mHello",
-        "Hello     \n" ++
-        "          \n");
-}
-
-test "golden: multiple CSI sequences ignored, text preserved" {
-    try expectSnapshot(1, 12, "\x1b[1m\x1b[31mHello\x1b[0m!",
-        "Hello!      \n");
-}
-
 test "golden: ESC non-bracket is ignored" {
-    // ESC X is an unknown escape — just ignored, Hello prints fine
     try expectSnapshot(2, 10, "\x1bXHello",
         "Hello     \n" ++
         "          \n");
 }
 
 // ===========================================================================
-// Incremental parsing across chunk boundaries (NEW in milestone 2)
+// Incremental parsing (carried from milestone 2)
 // ===========================================================================
 
 test "golden: ESC split across chunks" {
-    // ESC arrives in one chunk, "[2J" in the next, then text
     try expectChunkedSnapshot(2, 10, &.{ "\x1b", "[2J", "Hello" },
         "Hello     \n" ++
         "          \n");
 }
 
 test "golden: CSI params split across chunks" {
-    // ESC[31 in first chunk, "mHello" in second — 'm' completes the CSI
     try expectChunkedSnapshot(2, 10, &.{ "\x1b[31", "mHello" },
         "Hello     \n" ++
         "          \n");
 }
 
 test "golden: text interleaved with split CSI" {
-    // "AB" then ESC[ then "1mCD" — AB prints, CSI is ignored, CD prints
     try expectChunkedSnapshot(2, 10, &.{ "AB\x1b[", "1mCD" },
         "ABCD      \n" ++
         "          \n");
 }
 
 test "golden: single-byte-at-a-time feeding" {
-    // Feed every byte individually — worst-case chunking
     try expectChunkedSnapshot(1, 5, &.{ "\x1b", "[", "3", "1", "m", "H", "i" },
         "Hi   \n");
+}
+
+// ===========================================================================
+// CSI Cursor Position — CUP (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: CUP moves cursor to absolute position" {
+    // ESC[3;4H → row 3, col 4 (1-based) → (2,3) 0-based
+    try expectSnapshot(4, 6, "\x1b[3;4HA",
+        "      \n" ++
+        "      \n" ++
+        "   A  \n" ++
+        "      \n");
+}
+
+test "golden: CUP with no params defaults to home" {
+    try expectSnapshot(2, 5, "ABCDE\x1b[HX",
+        "XBCDE\n" ++
+        "     \n");
+}
+
+test "golden: CUP clamps to screen bounds" {
+    // Move back 1 after clamping to avoid wrap at last cell
+    try expectSnapshot(3, 5, "\x1b[99;99H\x1b[DX",
+        "     \n" ++
+        "     \n" ++
+        "   X \n");
+}
+
+test "golden: CUP with f final byte" {
+    try expectSnapshot(3, 5, "\x1b[2;3fX",
+        "     \n" ++
+        "  X  \n" ++
+        "     \n");
+}
+
+// ===========================================================================
+// CSI Cursor Movement — CUU/CUD/CUF/CUB (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: CUF moves cursor right" {
+    try expectSnapshot(2, 6, "A\x1b[2CB",
+        "A  B  \n" ++
+        "      \n");
+}
+
+test "golden: CUB moves cursor left" {
+    try expectSnapshot(1, 6, "ABCDE\x1b[3DX",
+        "ABXDE \n");
+}
+
+test "golden: CUU moves cursor up" {
+    try expectSnapshot(3, 4, "A\r\nB\r\nC\x1b[2AX",
+        "AX  \n" ++
+        "B   \n" ++
+        "C   \n");
+}
+
+test "golden: CUD moves cursor down" {
+    try expectSnapshot(3, 4, "A\x1b[2BX",
+        "A   \n" ++
+        "    \n" ++
+        " X  \n");
+}
+
+test "golden: cursor movement defaults n to 1" {
+    // CUB with no param defaults to 1. X overwrites the char at cursor.
+    try expectSnapshot(1, 6, "ABC\x1b[DX",
+        "ABX   \n");
+}
+
+test "golden: cursor movement clamps at boundaries" {
+    try expectSnapshot(2, 4, "\x1b[99AX\x1b[99DY",
+        "Y   \n" ++
+        "    \n");
+}
+
+// ===========================================================================
+// CSI Erase in Display — ED (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: erase display to end (default)" {
+    try expectSnapshot(3, 5, "AAA\r\nBBB\r\nCCC\x1b[2;3H\x1b[J",
+        "AAA  \n" ++
+        "BB   \n" ++
+        "     \n");
+}
+
+test "golden: erase display to start" {
+    try expectSnapshot(3, 5, "AAAA\r\nBBBB\r\nCCCC\x1b[2;3H\x1b[1J",
+        "     \n" ++
+        "   B \n" ++
+        "CCCC \n");
+}
+
+test "golden: erase entire display" {
+    try expectSnapshot(2, 5, "AB\r\nCD\x1b[2J",
+        "     \n" ++
+        "     \n");
+}
+
+// ===========================================================================
+// CSI Erase in Line — EL (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: erase line to end (default)" {
+    try expectSnapshot(2, 7, "Hello!\r\nWorld!\x1b[1;4H\x1b[K",
+        "Hel    \n" ++
+        "World! \n");
+}
+
+test "golden: erase line to start" {
+    // Clears from col 0 to cursor col (inclusive): cols 0-3 become spaces
+    try expectSnapshot(2, 7, "Hello!\r\nWorld!\x1b[1;4H\x1b[1K",
+        "    o! \n" ++
+        "World! \n");
+}
+
+test "golden: erase entire line" {
+    try expectSnapshot(2, 6, "ABCDE\r\nFGHIJ\x1b[1;3H\x1b[2K",
+        "      \n" ++
+        "FGHIJ \n");
+}
+
+// ===========================================================================
+// CSI SGR — colors and attributes (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: SGR does not affect character output" {
+    try expectSnapshot(2, 4, "\x1b[31mAB\x1b[0mCD",
+        "ABCD\n" ++
+        "    \n");
+}
+
+test "golden: multiple CSI sequences with text" {
+    try expectSnapshot(1, 12, "\x1b[1m\x1b[31mHello\x1b[0m World",
+        "Hello World \n");
+}
+
+// -- Attribute tests (inspect cell styles directly) --
+
+test "attr: SGR 31m sets foreground to red" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 10);
+    defer engine.deinit();
+
+    engine.feed("\x1b[31mA\x1b[0mB");
+
+    const cell_a = engine.state.grid.getCell(0, 0);
+    const cell_b = engine.state.grid.getCell(0, 1);
+    try std.testing.expectEqual(Color.red, cell_a.style.fg);
+    try std.testing.expectEqual(Color.default, cell_b.style.fg);
+}
+
+test "attr: SGR 0m resets all attributes" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 10);
+    defer engine.deinit();
+
+    engine.feed("\x1b[1;31;4mA\x1b[0mB");
+
+    const cell_a = engine.state.grid.getCell(0, 0);
+    try std.testing.expectEqual(Color.red, cell_a.style.fg);
+    try std.testing.expect(cell_a.style.bold);
+    try std.testing.expect(cell_a.style.underline);
+
+    const cell_b = engine.state.grid.getCell(0, 1);
+    try std.testing.expectEqual(Color.default, cell_b.style.fg);
+    try std.testing.expect(!cell_b.style.bold);
+    try std.testing.expect(!cell_b.style.underline);
+}
+
+test "attr: SGR sets foreground and background independently" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 10);
+    defer engine.deinit();
+
+    engine.feed("\x1b[32;43mA");
+
+    const cell = engine.state.grid.getCell(0, 0);
+    try std.testing.expectEqual(Color.green, cell.style.fg);
+    try std.testing.expectEqual(Color.yellow, cell.style.bg);
+}
+
+test "attr: SGR 39 resets fg, 49 resets bg" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 10);
+    defer engine.deinit();
+
+    engine.feed("\x1b[31;42mA\x1b[39mB\x1b[49mC");
+
+    const cell_a = engine.state.grid.getCell(0, 0);
+    try std.testing.expectEqual(Color.red, cell_a.style.fg);
+    try std.testing.expectEqual(Color.green, cell_a.style.bg);
+
+    const cell_b = engine.state.grid.getCell(0, 1);
+    try std.testing.expectEqual(Color.default, cell_b.style.fg);
+    try std.testing.expectEqual(Color.green, cell_b.style.bg);
+
+    const cell_c = engine.state.grid.getCell(0, 2);
+    try std.testing.expectEqual(Color.default, cell_c.style.fg);
+    try std.testing.expectEqual(Color.default, cell_c.style.bg);
+}
+
+test "attr: bold and underline flags" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 10);
+    defer engine.deinit();
+
+    engine.feed("\x1b[1mB\x1b[4mU\x1b[0mN");
+
+    const cell_b = engine.state.grid.getCell(0, 0);
+    try std.testing.expect(cell_b.style.bold);
+    try std.testing.expect(!cell_b.style.underline);
+
+    const cell_u = engine.state.grid.getCell(0, 1);
+    try std.testing.expect(cell_u.style.bold);
+    try std.testing.expect(cell_u.style.underline);
+
+    const cell_n = engine.state.grid.getCell(0, 2);
+    try std.testing.expect(!cell_n.style.bold);
+    try std.testing.expect(!cell_n.style.underline);
+}
+
+// ===========================================================================
+// Incremental CSI with semantics (NEW in milestone 3)
+// ===========================================================================
+
+test "golden: CSI cursor movement split across chunks" {
+    try expectChunkedSnapshot(3, 5, &.{ "A\x1b[3", ";2HB" },
+        "A    \n" ++
+        "     \n" ++
+        " B   \n");
+}
+
+test "golden: CSI SGR split across chunks preserves color" {
+    const alloc = std.testing.allocator;
+    const snap = try runner.runChunked(alloc, 1, 4, &.{ "\x1b[3", "1mAB" });
+    defer alloc.free(snap);
+    try std.testing.expectEqualStrings("AB  \n", snap);
+
+    // Also verify the color was applied by running through Engine directly
+    var engine = try Engine.init(alloc, 1, 4);
+    defer engine.deinit();
+    engine.feed("\x1b[3");
+    engine.feed("1mAB");
+    try std.testing.expectEqual(Color.red, engine.state.grid.getCell(0, 0).style.fg);
 }
