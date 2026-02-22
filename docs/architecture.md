@@ -26,15 +26,16 @@ Actions to the **Grid**. The **Engine** glues them together with a simple
 ```
 src/
   term/              Pure terminal engine (no side effects)
-    actions.zig        Action union + ControlCode enum
-    parser.zig         Incremental VT parser (ground/escape/CSI states)
-    state.zig          TerminalState — grid + cursor + apply(Action)
+    actions.zig        Action union + ControlCode enum + mode types
+    parser.zig         Incremental VT parser (ground/escape/CSI/OSC states)
+    state.zig          TerminalState — grid + cursor + modes + apply(Action)
     grid.zig           Cell + Grid — 2D character storage
     snapshot.zig       Serialize grid to plain text for testing
     engine.zig         Glue layer: Parser + TerminalState
+    input.zig          Input encoder: paste wrapping + mouse SGR encoding
   headless/          Deterministic runner + tests
     runner.zig         Convenience functions for test harness
-    tests.zig          Golden snapshot tests
+    tests.zig          Golden snapshot tests + attribute tests
   root.zig           Library root — re-exports public API
   main.zig           Executable entry point (placeholder)
 ```
@@ -67,17 +68,24 @@ pub const Action = union(enum) {
     leave_alt_screen,                // ESC[?1049l — switch to main buffer
     save_cursor,                     // ESC 7 / CSI s — save cursor + pen
     restore_cursor,                  // ESC 8 / CSI u — restore cursor + pen
+    hyperlink_start: []const u8,     // OSC 8 — start hyperlink (URI borrowed)
+    hyperlink_end,                   // OSC 8 — end hyperlink
+    set_title: []const u8,           // OSC 0/2 — set terminal title (borrowed)
+    dec_private_mode: DecPrivateModes, // ESC[?...h/l — compound mode set/reset
 };
 ```
 
 ### Parser (`term/parser.zig`)
 
-Three-state machine: Ground → Escape → CSI.
+Five-state machine: Ground → Escape → CSI / OSC.
 
 ```
 Ground ──ESC──▸ Escape ──[──▸ CSI
   ▲                │            │
-  └──── any ◂──────┘   final ──┘
+  │                ]──▸ OSC ──BEL──▸ dispatch
+  │                      │
+  │                      ESC──▸ OscEscape ──\──▸ dispatch
+  └──── any ◂───────────────────────────────────┘
 ```
 
 - `next(byte) → ?Action` — process one byte, return action or null.
@@ -93,16 +101,26 @@ Ground ──ESC──▸ Escape ──[──▸ CSI
 - `apply(action)` — the only way state changes.
 - Scroll region (`scroll_top`, `scroll_bottom`) bounds scrolling to a subset of rows.
   Default = full screen. Only LF/IND/RI/wrap respect the region; cursor movement is screen-wide.
-- **Alternate screen:** `swapBuffers()` exchanges all 6 per-buffer field pairs
+- **Hyperlinks:** `link_uris` table maps `link_id → URI`. `pen_link_id` is per-buffer.
+  `getLinkUri(id)` for lookup. Allocations happen per hyperlink start only.
+- **Title:** `title: ?[]const u8` — latest OSC 0/2 title, globally shared.
+- **Terminal modes** (global, not per-buffer): `bracketed_paste: bool`,
+  `mouse_tracking: MouseTrackingMode` (.off/.x10/.button_event/.any_event),
+  `mouse_sgr: bool`. These persist across alt screen switches.
+- **Alternate screen:** `swapBuffers()` exchanges all 7 per-buffer field pairs
   using `std.mem.swap` (zero-copy for grids). Enter clears the alt grid;
   leave restores main as-is.
 - **SavedCursor:** captures cursor, pen, and scroll region. Stored per-buffer
   (swapped with the rest), so main/alt saves are isolated.
 
-### Cell + Style (`term/grid.zig`)
+### Cell + Style + Color (`term/grid.zig`)
 
-- `Color` enum: `default`, `black`, `red`, `green`, `yellow`, `blue`,
-  `magenta`, `cyan`, `white`.
+- `Color` tagged union with four variants:
+  - `default` — terminal theme color
+  - `ansi: u8` — standard (0–7) or bright (8–15) ANSI color
+  - `palette: u8` — 256-color xterm palette index
+  - `rgb: Rgb` — 24-bit truecolor (`struct { r: u8, g: u8, b: u8 }`)
+- Named constants: `Color.black`, `Color.red`, ..., `Color.white` for ANSI 0–7.
 - `Style` struct: `fg: Color`, `bg: Color`, `bold: bool`, `underline: bool`.
 - `Cell` struct: `char: u8`, `style: Style`.
 
@@ -120,10 +138,31 @@ Ground ──ESC──▸ Escape ──[──▸ CSI
 ### Parser DEC Private Mode
 
 DEC private mode sequences (`ESC[?...h` / `ESC[?...l`) are recognized by
-detecting a `?` prefix in the CSI parameter buffer. Supported modes:
+detecting a `?` prefix in the CSI parameter buffer. The parser emits a
+single `dec_private_mode` action carrying all params (up to 8), so
+compound sequences like `ESC[?1000;1006h` are supported.
+
+Supported modes:
 
 | Mode | Set (h) | Reset (l) |
 |------|---------|-----------|
 | 47 / 1047 / 1049 | Enter alt screen | Leave alt screen |
+| 1000 | X10 mouse tracking | Off (if active) |
+| 1002 | Button-event tracking | Off (if active) |
+| 1003 | Any-event tracking | Off (if active) |
+| 1006 | SGR mouse encoding | Disable SGR encoding |
+| 2004 | Bracketed paste | Disable bracketed paste |
 
-Unsupported modes emit `nop`.
+Unrecognized modes are silently ignored by the state.
+
+### Input Encoder (`term/input.zig`)
+
+Pure, allocation-free functions for producing bytes to send to the PTY:
+
+- `wrapPaste(enabled, text, out_buf)` — wraps text with `ESC[200~`/`ESC[201~`
+  when bracketed paste is active.
+- `encodeMouse(tracking, sgr_enabled, event, out_buf)` — SGR mouse encoding
+  (`CSI < Cb;Cx;Cy M/m`). Returns empty when tracking is off or SGR disabled.
+  Move events only reported in `any_event` mode.
+
+All write into caller-provided buffers. No allocations.

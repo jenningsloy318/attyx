@@ -8,6 +8,8 @@ const State = enum {
     ground,
     escape,
     csi,
+    osc,
+    osc_escape,
 };
 
 /// Intermediate result of parsing CSI parameter bytes (e.g. "31;1" → [31, 1]).
@@ -25,6 +27,8 @@ const CsiParams = struct {
 ///
 /// Zero allocations — all state lives in fixed-size fields.
 pub const Parser = struct {
+    pub const osc_buf_size = 4096;
+
     state: State = .ground,
 
     /// Buffer for CSI parameter/intermediate bytes (retained for debug tracing).
@@ -35,13 +39,24 @@ pub const Parser = struct {
     /// The byte that followed ESC in the last non-CSI escape (for tracing).
     last_esc_byte: u8 = 0,
 
+    /// Buffer for OSC payload bytes (e.g. "8;;https://example.com").
+    osc_buf: [osc_buf_size]u8 = undefined,
+    osc_len: u16 = 0,
+    osc_overflow: bool = false,
+
     /// Process a single byte. Returns an Action if one is ready,
     /// or null if the byte was consumed as part of an incomplete sequence.
+    ///
+    /// NOTE: Actions with borrowed slices (hyperlink_start, set_title) point
+    /// into the parser's internal osc_buf and are only valid until the next
+    /// call to next(). The Engine.feed() loop consumes them immediately.
     pub fn next(self: *Parser, byte: u8) ?Action {
         return switch (self.state) {
             .ground => self.onGround(byte),
             .escape => self.onEscape(byte),
             .csi => self.onCsi(byte),
+            .osc => self.onOsc(byte),
+            .osc_escape => self.onOscEscape(byte),
         };
     }
 
@@ -84,6 +99,12 @@ pub const Parser = struct {
             '8' => {
                 self.state = .ground;
                 return .restore_cursor;
+            },
+            ']' => {
+                self.state = .osc;
+                self.osc_len = 0;
+                self.osc_overflow = false;
+                return null;
             },
             0x1B => {
                 return .nop;
@@ -140,6 +161,66 @@ pub const Parser = struct {
             'r' => makeSetScrollRegion(params),
             's' => .save_cursor,
             'u' => .restore_cursor,
+            else => .nop,
+        };
+    }
+
+    // -- OSC handlers ------------------------------------------------------
+
+    fn onOsc(self: *Parser, byte: u8) ?Action {
+        switch (byte) {
+            0x07, 0x9C => {
+                self.state = .ground;
+                return self.dispatchOsc();
+            },
+            0x1B => {
+                self.state = .osc_escape;
+                return null;
+            },
+            else => {
+                if (!self.osc_overflow) {
+                    if (self.osc_len < self.osc_buf.len) {
+                        self.osc_buf[self.osc_len] = byte;
+                        self.osc_len += 1;
+                    } else {
+                        self.osc_overflow = true;
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    fn onOscEscape(self: *Parser, byte: u8) ?Action {
+        if (byte == '\\') {
+            self.state = .ground;
+            return self.dispatchOsc();
+        }
+        self.state = .escape;
+        return self.onEscape(byte);
+    }
+
+    fn dispatchOsc(self: *Parser) Action {
+        if (self.osc_overflow) return .nop;
+        const payload = self.osc_buf[0..self.osc_len];
+        if (payload.len == 0) return .nop;
+
+        var num_end: usize = 0;
+        while (num_end < payload.len and
+            payload[num_end] >= '0' and payload[num_end] <= '9') : (num_end += 1)
+        {}
+        if (num_end == 0) return .nop;
+
+        const num = std.fmt.parseInt(u16, payload[0..num_end], 10) catch return .nop;
+
+        const rest: []const u8 = if (num_end < payload.len and payload[num_end] == ';')
+            payload[num_end + 1 ..]
+        else
+            "";
+
+        return switch (num) {
+            0, 2 => .{ .set_title = rest },
+            8 => makeOscHyperlink(rest),
             else => .nop,
         };
     }
@@ -240,29 +321,26 @@ fn makeSgr(params: CsiParams) Action {
 }
 
 /// DEC private mode dispatch (ESC[?...h / ESC[?...l).
+/// Packs all mode params into a single compound action so multi-param
+/// sequences like ESC[?1000;1006h are applied atomically by the state.
 fn dispatchDecPrivate(final: u8, param_buf: []const u8) Action {
     const params = parseCsiParams(param_buf);
+    if (params.len == 0) return .nop;
     return switch (final) {
-        'h' => makeDecSet(params),
-        'l' => makeDecReset(params),
+        'h' => makeDecPrivateMode(params, true),
+        'l' => makeDecPrivateMode(params, false),
         else => .nop,
     };
 }
 
-fn makeDecSet(params: CsiParams) Action {
-    if (params.len == 0) return .nop;
-    return switch (params.params[0]) {
-        47, 1047, 1049 => .enter_alt_screen,
-        else => .nop,
-    };
-}
-
-fn makeDecReset(params: CsiParams) Action {
-    if (params.len == 0) return .nop;
-    return switch (params.params[0]) {
-        47, 1047, 1049 => .leave_alt_screen,
-        else => .nop,
-    };
+fn makeDecPrivateMode(params: CsiParams, set: bool) Action {
+    var dm = actions_mod.DecPrivateModes{ .set = set };
+    const count = @min(params.len, 8);
+    for (params.params[0..count]) |p| {
+        dm.params[dm.len] = p;
+        dm.len += 1;
+    }
+    return .{ .dec_private_mode = dm };
 }
 
 /// DECSTBM (ESC[top;bottom r) — carries raw 1-based values (0 = default).
@@ -270,6 +348,17 @@ fn makeSetScrollRegion(params: CsiParams) Action {
     const top: u16 = if (params.len > 0) params.params[0] else 0;
     const bottom: u16 = if (params.len > 1) params.params[1] else 0;
     return .{ .set_scroll_region = .{ .top = top, .bottom = bottom } };
+}
+
+/// Parse the rest of an OSC 8 payload after the "8;".
+/// Format: "params;URI" — params are ignored, URI determines start/end.
+fn makeOscHyperlink(rest: []const u8) Action {
+    var i: usize = 0;
+    while (i < rest.len and rest[i] != ';') : (i += 1) {}
+    if (i >= rest.len) return .hyperlink_end;
+    const uri = rest[i + 1 ..];
+    if (uri.len == 0) return .hyperlink_end;
+    return .{ .hyperlink_start = uri };
 }
 
 // ---------------------------------------------------------------------------
@@ -537,35 +626,155 @@ test "CSI ?1049h produces enter_alt_screen" {
     try std.testing.expectEqual(@as(u8, 'h'), p.csi_final);
 }
 
-test "CSI ?1049l produces leave_alt_screen" {
+test "CSI ?1049l produces dec_private_mode reset" {
     var p: Parser = .{};
     var last: ?Action = null;
     for ("\x1b[?1049l") |byte| {
         if (p.next(byte)) |a| last = a;
     }
-    try std.testing.expectEqual(Action.leave_alt_screen, last.?);
+    switch (last.?) {
+        .dec_private_mode => |dm| {
+            try std.testing.expectEqual(@as(u8, 1), dm.len);
+            try std.testing.expectEqual(@as(u16, 1049), dm.params[0]);
+            try std.testing.expect(!dm.set);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
-test "CSI ?47h and ?1047h also produce enter_alt_screen" {
+test "CSI ?47h and ?1047h produce dec_private_mode set" {
     var p: Parser = .{};
     var last: ?Action = null;
     for ("\x1b[?47h") |byte| {
         if (p.next(byte)) |a| last = a;
     }
-    try std.testing.expectEqual(Action.enter_alt_screen, last.?);
+    switch (last.?) {
+        .dec_private_mode => |dm| {
+            try std.testing.expectEqual(@as(u16, 47), dm.params[0]);
+            try std.testing.expect(dm.set);
+        },
+        else => return error.TestExpectedEqual,
+    }
 
     last = null;
     for ("\x1b[?1047h") |byte| {
         if (p.next(byte)) |a| last = a;
     }
-    try std.testing.expectEqual(Action.enter_alt_screen, last.?);
+    switch (last.?) {
+        .dec_private_mode => |dm| try std.testing.expectEqual(@as(u16, 1047), dm.params[0]),
+        else => return error.TestExpectedEqual,
+    }
 }
 
-test "CSI ?unsupported returns nop" {
+test "CSI ?unsupported still produces dec_private_mode" {
     var p: Parser = .{};
     var last: ?Action = null;
     for ("\x1b[?25h") |byte| {
         if (p.next(byte)) |a| last = a;
     }
-    try std.testing.expectEqual(Action.nop, last.?);
+    switch (last.?) {
+        .dec_private_mode => |dm| {
+            try std.testing.expectEqual(@as(u16, 25), dm.params[0]);
+            try std.testing.expect(dm.set);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "CSI ?1000;1006h produces compound dec_private_mode" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b[?1000;1006h") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    switch (last.?) {
+        .dec_private_mode => |dm| {
+            try std.testing.expectEqual(@as(u8, 2), dm.len);
+            try std.testing.expectEqual(@as(u16, 1000), dm.params[0]);
+            try std.testing.expectEqual(@as(u16, 1006), dm.params[1]);
+            try std.testing.expect(dm.set);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "OSC 8 hyperlink start (BEL terminator)" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b]8;;https://example.com\x07") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    switch (last.?) {
+        .hyperlink_start => |uri| try std.testing.expectEqualStrings("https://example.com", uri),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "OSC 8 hyperlink start (ST terminator)" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b]8;;https://example.com\x1b\\") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    switch (last.?) {
+        .hyperlink_start => |uri| try std.testing.expectEqualStrings("https://example.com", uri),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "OSC 8 hyperlink end" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b]8;;\x07") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    try std.testing.expectEqual(Action.hyperlink_end, last.?);
+}
+
+test "OSC 2 title" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b]2;My Title\x07") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    switch (last.?) {
+        .set_title => |title| try std.testing.expectEqualStrings("My Title", title),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "OSC 0 also sets title" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b]0;WindowTitle\x1b\\") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    switch (last.?) {
+        .set_title => |title| try std.testing.expectEqualStrings("WindowTitle", title),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "OSC overflow produces nop" {
+    var p: Parser = .{};
+    // Start OSC
+    _ = p.next(0x1B);
+    _ = p.next(']');
+    _ = p.next('8');
+    _ = p.next(';');
+    _ = p.next(';');
+    // Fill past the buffer
+    for (0..Parser.osc_buf_size) |_| _ = p.next('x');
+    try std.testing.expect(p.osc_overflow);
+    // Terminate
+    const a = p.next(0x07).?;
+    try std.testing.expectEqual(Action.nop, a);
+    try std.testing.expectEqual(State.ground, p.state);
+}
+
+test "OSC returns to ground after dispatch" {
+    var p: Parser = .{};
+    for ("\x1b]8;;uri\x07") |byte| _ = p.next(byte);
+    try std.testing.expectEqual(State.ground, p.state);
+    try std.testing.expectEqual(Action{ .print = 'Z' }, p.next('Z').?);
 }

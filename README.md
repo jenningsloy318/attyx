@@ -43,10 +43,11 @@ Raw bytes ─▸ Parser ─▸ Action ─▸ State.apply() ─▸ Grid
 
 ### Key types
 
-- **`Action`** — tagged union (16 variants: `print`, `control`, `nop`, `cursor_abs`, `cursor_rel`, `erase_display`, `erase_line`, `sgr`, `set_scroll_region`, `index`, `reverse_index`, `enter_alt_screen`, `leave_alt_screen`, `save_cursor`, `restore_cursor`) — the vocabulary between parser and state.
-- **`Parser`** — incremental 3-state machine (ground → escape → CSI). Zero allocations, handles partial sequences across chunk boundaries. Recognizes DEC private modes (`ESC[?...h/l`).
-- **`TerminalState`** — dual-buffer (main + alt) with per-buffer cursor, pen, scroll region, and saved cursor. Mutates only via `apply(action)`.
+- **`Action`** — tagged union (20 variants including `print`, `control`, `sgr`, `enter_alt_screen`, `hyperlink_start`, `dec_private_mode`, ...) — the vocabulary between parser and state.
+- **`Parser`** — incremental 5-state machine (ground → escape → CSI / OSC). Zero allocations in hot path, handles partial sequences across chunk boundaries. Recognizes DEC private modes and OSC sequences.
+- **`TerminalState`** — dual-buffer (main + alt) with per-buffer cursor, pen, scroll region, saved cursor, and hyperlink state. Global hyperlink table, title, and terminal mode flags (mouse tracking, bracketed paste). Mutates only via `apply(action)`.
 - **`Engine`** — glue that connects parser and state with a simple `feed(bytes)` API.
+- **`input`** — allocation-free input encoder: bracketed paste wrapping and SGR mouse event encoding.
 
 See [docs/architecture.md](docs/architecture.md) for the full breakdown.
 
@@ -77,12 +78,13 @@ The test suite uses **golden snapshot testing**: feed known bytes into a termina
 | What's tested | Count |
 |---------------|-------|
 | Grid operations (get/set, scroll, clear, region scroll, style) | 7 |
-| Parser state machine (ESC, CSI, dispatch, DEC private mode, save/restore) | 30 |
-| State mutations (apply each action type, scroll regions, alt screen, save/restore) | 12 |
+| Parser state machine (ESC, CSI, DEC private mode, OSC dispatch) | 39 |
+| State mutations (apply actions, scroll regions, alt screen, hyperlinks, title) | 16 |
 | Snapshot serialization | 2 |
+| Input encoder (paste wrapper, SGR mouse encoding) | 15 |
 | Engine + runner integration | 3 |
-| Golden + attribute tests (text, cursor, erase, SGR, regions, alt screen, save/restore) | 68 |
-| **Total** | **122** |
+| Golden + attribute tests (text, cursor, erase, SGR, 256/truecolor, alt, OSC, modes) | 109 |
+| **Total** | **191** |
 
 See [docs/testing.md](docs/testing.md) for the full testing strategy.
 
@@ -99,9 +101,9 @@ Attyx is built milestone by milestone. Each milestone is stable and tested befor
 | 3 | Minimal CSI support (cursor movement, erase, SGR 16 colors) | ✅ Done |
 | 4 | Scroll regions (DECSTBM) + Index/Reverse Index | ✅ Done |
 | 5 | Alternate screen + save/restore cursor + mode handling | ✅ Done |
-| 6 | Damage tracking (dirty rows) | Planned |
-| 7 | PTY integration | Planned |
-| 8 | GPU rendering | Planned |
+| 6 | SGR extended colors (256-color + truecolor) | ✅ Done |
+| 7 | OSC support (hyperlinks + title) | ✅ Done |
+| 8 | Mouse reporting + bracketed paste + input encoder | ✅ Done |
 
 See [docs/milestones.md](docs/milestones.md) for detailed write-ups.
 
@@ -112,15 +114,16 @@ See [docs/milestones.md](docs/milestones.md) for detailed write-ups.
 ```
 src/
   term/
-    actions.zig      Action union + control/CSI types
-    parser.zig       Incremental VT parser (ground/escape/CSI)
-    state.zig        TerminalState — grid + cursor + pen + apply()
+    actions.zig      Action union + control/CSI/mode types
+    parser.zig       Incremental VT parser (ground/escape/CSI/OSC)
+    state.zig        TerminalState — grid + cursor + pen + modes + apply()
     grid.zig         Cell + Grid + Color + Style
     snapshot.zig     Grid → plain text serialization
     engine.zig       Glue: Parser + TerminalState
+    input.zig        Input encoder: paste wrapping + mouse SGR
   headless/
     runner.zig       Test convenience functions
-    tests.zig        Golden snapshot tests
+    tests.zig        Golden snapshot + attribute tests
   root.zig           Library root
   main.zig           Executable entry point
 docs/

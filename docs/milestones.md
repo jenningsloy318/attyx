@@ -9,7 +9,9 @@
 | 3 | Minimal CSI support (cursor, erase, SGR) | ✅ Done |
 | 4 | Scroll regions (DECSTBM) + IND/RI | ✅ Done |
 | 5 | Alternate screen + save/restore cursor + mode handling | ✅ Done |
-| 6 | Damage tracking | Planned |
+| 6 | SGR extended colors (256-color + truecolor) | ✅ Done |
+| 7 | OSC support — hyperlinks + title | ✅ Done |
+| 8 | Mouse reporting + bracketed paste + input encoder | ✅ Done |
 
 ---
 
@@ -273,3 +275,214 @@ alt cleared on re-entry, `?47h`/`?1047h` variants, double-enter idempotency,
 cursor restore on leave, DECSC/DECRC golden test, CSI s/u golden test,
 save/restore pen attributes, per-buffer cursor isolation, save/restore
 scroll region capture, DEC private mode parsing, unsupported mode nop.
+
+---
+
+## Milestone 6 — SGR extended colors (256-color + truecolor + bright)
+
+**Goal:** Extend SGR support from 8 basic ANSI colors to the full spectrum:
+256-color palette and 24-bit truecolor for both foreground and background.
+
+### Color type redesign
+
+The `Color` type changed from a flat `enum(u8)` (~1 byte) to a tagged union
+(~4 bytes) with four variants:
+
+```zig
+pub const Color = union(enum) {
+    default,          // terminal theme color
+    ansi: u8,         // 0–15 standard + bright
+    palette: u8,      // 0–255 xterm palette
+    rgb: Rgb,         // 24-bit truecolor
+};
+```
+
+Named constants (`Color.red`, `Color.green`, etc.) preserve backward
+compatibility with existing tests and code.
+
+### SGR forms now supported
+
+| SGR code | Meaning |
+|----------|---------|
+| `0` | Reset all attributes |
+| `1` | Bold |
+| `4` | Underline |
+| `30–37` | Standard ANSI fg (black..white) |
+| `38;5;n` | 256-color fg (n=0..255) |
+| `38;2;r;g;b` | Truecolor fg |
+| `39` | Reset fg to default |
+| `40–47` | Standard ANSI bg |
+| `48;5;n` | 256-color bg |
+| `48;2;r;g;b` | Truecolor bg |
+| `49` | Reset bg to default |
+| `90–97` | Bright ANSI fg (colors 8–15) |
+| `100–107` | Bright ANSI bg (colors 8–15) |
+
+### Parser behavior
+
+No parser changes needed. The CSI parameter buffer already stores the full
+`;`-separated integer list. The `Sgr` action carries a `[16]u8` param array
+which is enough for even combined sequences like `38;5;196;48;2;10;20;30;1`.
+
+### State changes
+
+`applySgr` switched from a `for` loop (one param per iteration) to a `while`
+loop with an explicit index. When it encounters `38` or `48`, it calls
+`parseExtendedColor()` which consumes 2 additional params (`5;n`) or 4
+additional params (`2;r;g;b`). Truncated groups are silently ignored.
+
+### Data model impact
+
+`Cell` grew from ~5 bytes to ~11 bytes due to the larger `Color` union. For a
+24×80 grid (two buffers), total memory went from ~19 KB to ~42 KB — negligible.
+
+**Tests added:** 12 new (134 total). Covers 256-color fg/bg, truecolor fg/bg,
+SGR 39 resetting truecolor, SGR 0 resetting 256-color + flags, combined
+256+truecolor in one sequence, bright fg (90–97), bright bg (100–107),
+truncated 38;5, truncated 38;2;r;g, and truecolor surviving chunked input.
+
+---
+
+## Milestone 7 — OSC support (hyperlinks + title)
+
+**Goal:** Implement OSC (Operating System Command) parsing and support OSC 8
+hyperlinks and OSC 0/2 terminal title. This enables clickable links in the
+terminal UI (when a renderer is added later).
+
+### OSC commands supported
+
+| Sequence | Name | Behavior |
+|----------|------|----------|
+| `ESC ] 8 ; params ; URI ST` | Hyperlink start | Attach URI to subsequent cells |
+| `ESC ] 8 ; ; ST` | Hyperlink end | Stop linking subsequent cells |
+| `ESC ] 0 ; title ST` | Set icon name + title | Store title in state |
+| `ESC ] 2 ; title ST` | Set title | Store title in state |
+
+ST (String Terminator) can be `ESC \` or BEL (0x07) or C1 ST (0x9C).
+
+### Parser changes
+
+Two new states added to the state machine:
+
+```
+Ground ──ESC──▸ Escape ──[──▸ CSI
+                   │
+                   ]──▸ OSC ──BEL/C1──▸ dispatch
+                         │
+                         ESC──▸ OscEscape ──\──▸ dispatch (ST)
+                                   │
+                                   other──▸ abort, re-enter Escape
+```
+
+A 4 KB fixed buffer (`osc_buf`) stores the OSC payload. If the payload exceeds
+the buffer, an overflow flag is set and the entire sequence is silently ignored.
+
+`dispatchOsc()` parses the leading number, splits on `;`, and routes to
+`makeOscHyperlink()` (for OSC 8) or emits `set_title` (for OSC 0/2).
+
+### Action variants added
+
+- `hyperlink_start: []const u8` — URI borrowed from parser's `osc_buf`
+- `hyperlink_end` — clears the current hyperlink
+- `set_title: []const u8` — title text borrowed from parser's `osc_buf`
+
+**Borrowed slices:** The URI and title payloads in actions point into the
+parser's internal buffer. They are only valid until the next `parser.next()`
+call. `Engine.feed()` consumes them immediately via `state.apply()`, which
+copies the data into its own allocations.
+
+### Data model changes
+
+- `Cell` gained `link_id: u32 = 0`.
+- `TerminalState` gained:
+  - `pen_link_id` / `inactive_pen_link_id` (per-buffer, swapped on alt screen)
+  - `link_uris: ArrayListUnmanaged([]const u8)` — allocated URI strings
+  - `next_link_id: u32` — monotonically increasing counter
+  - `title: ?[]const u8` — latest terminal title
+- `getLinkUri(link_id) ?[]const u8` — public lookup method.
+- `deinit()` frees all URI strings and title.
+- Allocations happen per hyperlink start (rare), not per character (hot path).
+
+### Hyperlink flow
+
+1. Parser emits `hyperlink_start("https://...")` with borrowed slice.
+2. `state.apply()` calls `startHyperlink()`: duplicates URI into state's
+   allocator, appends to `link_uris`, sets `pen_link_id = next_link_id++`.
+3. `printChar()` stamps each new cell with `pen_link_id`.
+4. Parser emits `hyperlink_end`.
+5. `state.apply()` calls `endHyperlink()`: sets `pen_link_id = 0`.
+6. Subsequent cells have `link_id = 0`.
+
+**Tests added:** 20 new (154 total). Covers OSC 8 hyperlink start/end (BEL and
+ST terminators), multiple links with distinct IDs, URI lookup, chunked OSC
+input, buffer overflow handling, snapshot unaffected by links, OSC 0/2 title
+set and replace, parser unit tests for OSC state machine and dispatch.
+
+---
+
+## Milestone 8 — Mouse reporting modes + bracketed paste + input encoder
+
+**Status:** ✅ Complete
+
+### What was added
+
+**Terminal mode flags** in `TerminalState` (global, not per-buffer):
+
+| Flag | Type | DEC Private Mode |
+|------|------|-----------------|
+| `bracketed_paste` | `bool` | `?2004h/l` |
+| `mouse_tracking` | `MouseTrackingMode` | `?1000h/l` (x10), `?1002h/l` (button_event), `?1003h/l` (any_event) |
+| `mouse_sgr` | `bool` | `?1006h/l` |
+
+**Compound DEC private mode action:** The parser now emits a single
+`dec_private_mode` action carrying up to 8 mode params for sequences like
+`ESC[?1000;1006h`. The state iterates through all params and applies each.
+This replaces the old single-param approach and subsumes alt screen
+handling (`?47`, `?1047`, `?1049`).
+
+**Mouse tracking precedence:** Enabling 1000/1002/1003 sets the tracking
+mode directly (last writer wins). Disabling only takes effect if the mode
+being disabled is currently active — otherwise it's a no-op.
+
+**Input encoder module (`src/term/input.zig`):** Pure, allocation-free
+functions that produce byte sequences for the PTY based on current modes:
+
+- `wrapPaste(enabled, text, out_buf) → []const u8` — wraps text with
+  `ESC[200~`/`ESC[201~` when bracketed paste is enabled.
+- `encodeMouse(tracking, sgr_enabled, event, out_buf) → []const u8` —
+  produces SGR mouse encoding (`CSI < Cb;Cx;Cy M/m`). Only SGR encoding
+  is implemented (legacy X10 `ESC[M` not needed for modern TUIs). Move
+  events are only reported in `any_event` mode.
+
+`MouseEvent` struct carries kind (press/release/move/scroll_up/scroll_down),
+button (left/middle/right/none), 1-based coordinates, and modifier booleans
+(shift/alt/ctrl).
+
+### Data flow
+
+```
+Application sends:  ESC[?1000;1006h
+Parser emits:       Action.dec_private_mode { params=[1000,1006], set=true }
+State applies:      mouse_tracking = .x10, mouse_sgr = true
+
+User clicks at (10,5):
+Input encoder:      encodeMouse(.x10, true, {press, left, 10, 5}) → "\x1b[<0;10;5M"
+→ bytes sent to PTY
+```
+
+### Files changed
+
+| File | Changes |
+|------|---------|
+| `src/term/actions.zig` | Added `MouseTrackingMode`, `DecPrivateModes`, `dec_private_mode` action variant |
+| `src/term/parser.zig` | `dispatchDecPrivate` now emits compound `dec_private_mode`; updated parser tests |
+| `src/term/state.zig` | Mode flags, `applyDecPrivateModes()` handler |
+| `src/term/input.zig` | **New module** — `wrapPaste()`, `encodeMouse()`, `MouseEvent` |
+| `src/root.zig` | Re-exports input module and new types |
+| `src/headless/tests.zig` | 22 new integration tests |
+
+**Tests added:** 37 new (191 total). Covers bracketed paste toggle, all
+mouse tracking modes (enable/disable/precedence/override), SGR mouse toggle,
+compound mode sequences, mode persistence across alt screen, paste wrapper
+output, SGR mouse encoding (press/release/scroll/ctrl+click), and
+incremental parsing for DEC private modes split across chunks.

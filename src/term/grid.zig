@@ -1,21 +1,29 @@
 const std = @import("std");
 
-/// Terminal color (the 8 standard ANSI colors + default).
-///
-/// Maps directly to SGR codes:
-///   fg 30–37  →  black..white
-///   bg 40–47  →  black..white
-///   39 / 49   →  default
-pub const Color = enum(u8) {
-    default = 0,
-    black,
-    red,
-    green,
-    yellow,
-    blue,
-    magenta,
-    cyan,
-    white,
+/// Terminal color — supports default, 8+8 ANSI, 256-color palette, and
+/// 24-bit truecolor.  Represented as a tagged union so each variant
+/// carries exactly the data it needs.
+pub const Color = union(enum) {
+    /// The terminal's default/theme color (SGR 39 / 49 / 0).
+    default,
+    /// Standard or bright ANSI color index 0–15 (SGR 30–37, 90–97, etc.).
+    ansi: u8,
+    /// 256-color palette index 0–255 (SGR 38;5;n / 48;5;n).
+    palette: u8,
+    /// 24-bit truecolor (SGR 38;2;r;g;b / 48;2;r;g;b).
+    rgb: Rgb,
+
+    pub const Rgb = struct { r: u8, g: u8, b: u8 };
+
+    // Named constants for the 8 standard ANSI colors.
+    pub const black: Color = .{ .ansi = 0 };
+    pub const red: Color = .{ .ansi = 1 };
+    pub const green: Color = .{ .ansi = 2 };
+    pub const yellow: Color = .{ .ansi = 3 };
+    pub const blue: Color = .{ .ansi = 4 };
+    pub const magenta: Color = .{ .ansi = 5 };
+    pub const cyan: Color = .{ .ansi = 6 };
+    pub const white: Color = .{ .ansi = 7 };
 };
 
 /// Visual attributes attached to each cell.
@@ -30,6 +38,8 @@ pub const Style = struct {
 pub const Cell = struct {
     char: u8 = ' ',
     style: Style = .{},
+    /// Hyperlink association (0 = none). Maps to TerminalState's link table.
+    link_id: u32 = 0,
 };
 
 /// Fixed-size 2D grid of cells, stored as a flat row-major array.

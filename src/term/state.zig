@@ -30,6 +30,7 @@ pub const TerminalState = struct {
     scroll_top: usize = 0,
     scroll_bottom: usize = 0,
     saved_cursor: ?SavedCursor = null,
+    pen_link_id: u32 = 0,
 
     // -- Inactive buffer state (swapped on alt screen toggle) --------------
     inactive_grid: Grid,
@@ -38,9 +39,20 @@ pub const TerminalState = struct {
     inactive_scroll_top: usize = 0,
     inactive_scroll_bottom: usize = 0,
     inactive_saved_cursor: ?SavedCursor = null,
+    inactive_pen_link_id: u32 = 0,
 
     /// True when the alternate screen is the active buffer.
     alt_active: bool = false,
+
+    // -- Global state (shared across buffers) ------------------------------
+    link_uris: std.ArrayListUnmanaged([]const u8) = .{},
+    next_link_id: u32 = 1,
+    title: ?[]const u8 = null,
+
+    // -- Terminal modes (global, not per-buffer) ----------------------------
+    bracketed_paste: bool = false,
+    mouse_tracking: actions_mod.MouseTrackingMode = .off,
+    mouse_sgr: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, rows: usize, cols: usize) !TerminalState {
         var main_grid = try Grid.init(allocator, rows, cols);
@@ -55,8 +67,20 @@ pub const TerminalState = struct {
     }
 
     pub fn deinit(self: *TerminalState) void {
+        const alloc = self.grid.allocator;
+        for (self.link_uris.items) |uri| alloc.free(uri);
+        self.link_uris.deinit(alloc);
+        if (self.title) |t| alloc.free(t);
         self.grid.deinit();
         self.inactive_grid.deinit();
+    }
+
+    /// Look up the URI for a given link_id. Returns null for id 0 or unknown ids.
+    pub fn getLinkUri(self: *const TerminalState, link_id: u32) ?[]const u8 {
+        if (link_id == 0) return null;
+        const idx = link_id - 1;
+        if (idx >= self.link_uris.items.len) return null;
+        return self.link_uris.items[idx];
     }
 
     /// Apply a single Action to the terminal state.
@@ -82,6 +106,10 @@ pub const TerminalState = struct {
             .leave_alt_screen => self.leaveAltScreen(),
             .save_cursor => self.saveCursor(),
             .restore_cursor => self.restoreCursor(),
+            .hyperlink_start => |uri| self.startHyperlink(uri),
+            .hyperlink_end => self.endHyperlink(),
+            .set_title => |t| self.setTitle(t),
+            .dec_private_mode => |modes| self.applyDecPrivateModes(modes),
         }
     }
 
@@ -91,6 +119,7 @@ pub const TerminalState = struct {
         self.grid.setCell(self.cursor.row, self.cursor.col, .{
             .char = char,
             .style = self.pen,
+            .link_id = self.pen_link_id,
         });
         self.cursor.col += 1;
         if (self.cursor.col >= self.grid.cols) {
@@ -191,18 +220,95 @@ pub const TerminalState = struct {
     // -- CSI SGR -----------------------------------------------------------
 
     fn applySgr(self: *TerminalState, sgr: actions_mod.Sgr) void {
-        for (sgr.params[0..sgr.len]) |param| {
-            switch (param) {
-                0 => self.pen = .{},
-                1 => self.pen.bold = true,
-                4 => self.pen.underline = true,
-                30...37 => self.pen.fg = @enumFromInt(param - 29),
-                39 => self.pen.fg = .default,
-                40...47 => self.pen.bg = @enumFromInt(param - 39),
-                49 => self.pen.bg = .default,
-                else => {},
+        const params = sgr.params[0..sgr.len];
+        var i: usize = 0;
+        while (i < params.len) {
+            const p = params[i];
+            switch (p) {
+                0 => {
+                    self.pen = .{};
+                    i += 1;
+                },
+                1 => {
+                    self.pen.bold = true;
+                    i += 1;
+                },
+                4 => {
+                    self.pen.underline = true;
+                    i += 1;
+                },
+                30...37 => {
+                    self.pen.fg = .{ .ansi = p - 30 };
+                    i += 1;
+                },
+                38 => {
+                    i = parseExtendedColor(self, params, i, true);
+                },
+                39 => {
+                    self.pen.fg = .default;
+                    i += 1;
+                },
+                40...47 => {
+                    self.pen.bg = .{ .ansi = p - 40 };
+                    i += 1;
+                },
+                48 => {
+                    i = parseExtendedColor(self, params, i, false);
+                },
+                49 => {
+                    self.pen.bg = .default;
+                    i += 1;
+                },
+                90...97 => {
+                    self.pen.fg = .{ .ansi = p - 82 };
+                    i += 1;
+                },
+                100...107 => {
+                    self.pen.bg = .{ .ansi = p - 92 };
+                    i += 1;
+                },
+                else => {
+                    i += 1;
+                },
             }
         }
+    }
+
+    fn parseExtendedColor(self: *TerminalState, params: []const u8, start: usize, is_fg: bool) usize {
+        var i = start + 1;
+        if (i >= params.len) return i;
+
+        if (params[i] == 5) {
+            i += 1;
+            if (i < params.len) {
+                const color = Color{ .palette = params[i] };
+                if (is_fg) {
+                    self.pen.fg = color;
+                } else {
+                    self.pen.bg = color;
+                }
+                i += 1;
+            }
+        } else if (params[i] == 2) {
+            i += 1;
+            if (i + 2 < params.len) {
+                const color = Color{ .rgb = .{
+                    .r = params[i],
+                    .g = params[i + 1],
+                    .b = params[i + 2],
+                } };
+                if (is_fg) {
+                    self.pen.fg = color;
+                } else {
+                    self.pen.bg = color;
+                }
+                i += 3;
+            }
+        } else {
+            i += 1;
+        }
+
+        return i;
     }
 
     // -- DECSTBM -----------------------------------------------------------
@@ -221,6 +327,40 @@ pub const TerminalState = struct {
         self.scroll_bottom = bottom;
     }
 
+    // -- DEC private modes ---------------------------------------------------
+
+    fn applyDecPrivateModes(self: *TerminalState, modes: actions_mod.DecPrivateModes) void {
+        for (modes.params[0..modes.len]) |param| {
+            if (modes.set) {
+                switch (param) {
+                    47, 1047, 1049 => self.enterAltScreen(),
+                    1000 => self.mouse_tracking = .x10,
+                    1002 => self.mouse_tracking = .button_event,
+                    1003 => self.mouse_tracking = .any_event,
+                    1006 => self.mouse_sgr = true,
+                    2004 => self.bracketed_paste = true,
+                    else => {},
+                }
+            } else {
+                switch (param) {
+                    47, 1047, 1049 => self.leaveAltScreen(),
+                    1000 => {
+                        if (self.mouse_tracking == .x10) self.mouse_tracking = .off;
+                    },
+                    1002 => {
+                        if (self.mouse_tracking == .button_event) self.mouse_tracking = .off;
+                    },
+                    1003 => {
+                        if (self.mouse_tracking == .any_event) self.mouse_tracking = .off;
+                    },
+                    1006 => self.mouse_sgr = false,
+                    2004 => self.bracketed_paste = false,
+                    else => {},
+                }
+            }
+        }
+    }
+
     // -- Alternate screen --------------------------------------------------
 
     fn swapBuffers(self: *TerminalState) void {
@@ -230,6 +370,7 @@ pub const TerminalState = struct {
         std.mem.swap(usize, &self.scroll_top, &self.inactive_scroll_top);
         std.mem.swap(usize, &self.scroll_bottom, &self.inactive_scroll_bottom);
         std.mem.swap(?SavedCursor, &self.saved_cursor, &self.inactive_saved_cursor);
+        std.mem.swap(u32, &self.pen_link_id, &self.inactive_pen_link_id);
     }
 
     fn enterAltScreen(self: *TerminalState) void {
@@ -238,6 +379,7 @@ pub const TerminalState = struct {
         @memset(self.grid.cells, Cell{});
         self.cursor = .{};
         self.pen = .{};
+        self.pen_link_id = 0;
         self.scroll_top = 0;
         self.scroll_bottom = self.grid.rows - 1;
         self.saved_cursor = null;
@@ -268,6 +410,37 @@ pub const TerminalState = struct {
             self.scroll_top = saved.scroll_top;
             self.scroll_bottom = saved.scroll_bottom;
         }
+    }
+
+    // -- OSC: hyperlinks + title -------------------------------------------
+
+    fn startHyperlink(self: *TerminalState, uri: []const u8) void {
+        if (uri.len == 0) {
+            self.pen_link_id = 0;
+            return;
+        }
+        const alloc = self.grid.allocator;
+        const uri_copy = alloc.dupe(u8, uri) catch return;
+        self.link_uris.append(alloc, uri_copy) catch {
+            alloc.free(uri_copy);
+            return;
+        };
+        self.pen_link_id = self.next_link_id;
+        self.next_link_id += 1;
+    }
+
+    fn endHyperlink(self: *TerminalState) void {
+        self.pen_link_id = 0;
+    }
+
+    fn setTitle(self: *TerminalState, title_slice: []const u8) void {
+        const alloc = self.grid.allocator;
+        if (self.title) |old| alloc.free(old);
+        if (title_slice.len == 0) {
+            self.title = null;
+            return;
+        }
+        self.title = alloc.dupe(u8, title_slice) catch null;
     }
 };
 
@@ -348,7 +521,7 @@ test "printed cells carry current pen style" {
     var t = try TerminalState.init(alloc, 2, 4);
     defer t.deinit();
 
-    t.pen = .{ .fg = .red, .bold = true };
+    t.pen = .{ .fg = Color.red, .bold = true };
     t.apply(.{ .print = 'A' });
     const cell = t.grid.getCell(0, 0);
     try std.testing.expectEqual(Color.red, cell.style.fg);
@@ -419,7 +592,7 @@ test "save and restore cursor" {
     defer t.deinit();
 
     t.cursor = .{ .row = 1, .col = 2 };
-    t.pen = .{ .fg = .red };
+    t.pen = .{ .fg = Color.red };
     t.apply(.save_cursor);
 
     t.cursor = .{ .row = 0, .col = 0 };
@@ -429,4 +602,46 @@ test "save and restore cursor" {
     try std.testing.expectEqual(@as(usize, 1), t.cursor.row);
     try std.testing.expectEqual(@as(usize, 2), t.cursor.col);
     try std.testing.expectEqual(Color.red, t.pen.fg);
+}
+
+test "printed cells carry pen_link_id" {
+    const alloc = std.testing.allocator;
+    var t = try TerminalState.init(alloc, 2, 4);
+    defer t.deinit();
+
+    t.pen_link_id = 42;
+    t.apply(.{ .print = 'L' });
+    try std.testing.expectEqual(@as(u32, 42), t.grid.getCell(0, 0).link_id);
+}
+
+test "startHyperlink allocates URI and sets pen_link_id" {
+    const alloc = std.testing.allocator;
+    var t = try TerminalState.init(alloc, 2, 4);
+    defer t.deinit();
+
+    t.apply(.{ .hyperlink_start = "https://example.com" });
+    try std.testing.expect(t.pen_link_id != 0);
+    try std.testing.expectEqualStrings("https://example.com", t.getLinkUri(t.pen_link_id).?);
+}
+
+test "endHyperlink clears pen_link_id" {
+    const alloc = std.testing.allocator;
+    var t = try TerminalState.init(alloc, 2, 4);
+    defer t.deinit();
+
+    t.apply(.{ .hyperlink_start = "https://example.com" });
+    t.apply(.hyperlink_end);
+    try std.testing.expectEqual(@as(u32, 0), t.pen_link_id);
+}
+
+test "setTitle stores and replaces title" {
+    const alloc = std.testing.allocator;
+    var t = try TerminalState.init(alloc, 2, 4);
+    defer t.deinit();
+
+    t.apply(.{ .set_title = "Hello" });
+    try std.testing.expectEqualStrings("Hello", t.title.?);
+
+    t.apply(.{ .set_title = "World" });
+    try std.testing.expectEqualStrings("World", t.title.?);
 }

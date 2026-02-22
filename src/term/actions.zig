@@ -48,6 +48,23 @@ pub const ScrollRegion = struct {
     bottom: u16 = 0,
 };
 
+/// Mouse tracking mode, controlled by DEC private modes 1000/1002/1003.
+pub const MouseTrackingMode = enum {
+    off,
+    x10,
+    button_event,
+    any_event,
+};
+
+/// Payload for a DEC private mode set (h) or reset (l) sequence.
+/// Carries up to 8 mode numbers so multi-param sequences like
+/// ESC[?1000;1006h can be applied atomically.
+pub const DecPrivateModes = struct {
+    params: [8]u16 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    len: u8 = 0,
+    set: bool = true,
+};
+
 /// A single terminal action produced by the parser.
 ///
 /// The parser converts raw bytes into Actions; TerminalState
@@ -83,4 +100,13 @@ pub const Action = union(enum) {
     save_cursor,
     /// ESC 8 / CSI u — restore cursor position + attributes.
     restore_cursor,
+    /// OSC 8 — start a hyperlink. Payload is a URI borrowed from parser buffer.
+    hyperlink_start: []const u8,
+    /// OSC 8 with empty URI — end current hyperlink.
+    hyperlink_end,
+    /// OSC 0/2 — set terminal title. Payload borrowed from parser buffer.
+    set_title: []const u8,
+    /// DEC private mode set/reset (ESC[?...h / ESC[?...l).
+    /// Carries all mode params; state iterates and applies each.
+    dec_private_mode: DecPrivateModes,
 };

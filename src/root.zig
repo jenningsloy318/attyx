@@ -9,6 +9,7 @@ pub const parser = @import("term/parser.zig");
 pub const state = @import("term/state.zig");
 pub const snapshot = @import("term/snapshot.zig");
 pub const engine = @import("term/engine.zig");
+pub const input = @import("term/input.zig");
 
 pub const Action = actions.Action;
 pub const ControlCode = actions.ControlCode;
@@ -16,6 +17,8 @@ pub const Direction = actions.Direction;
 pub const EraseMode = actions.EraseMode;
 pub const Sgr = actions.Sgr;
 pub const ScrollRegion = actions.ScrollRegion;
+pub const MouseTrackingMode = actions.MouseTrackingMode;
+pub const DecPrivateModes = actions.DecPrivateModes;
 pub const SavedCursor = state.SavedCursor;
 pub const Cell = grid.Cell;
 pub const Grid = grid.Grid;
@@ -25,6 +28,9 @@ pub const Parser = parser.Parser;
 pub const TerminalState = state.TerminalState;
 pub const Cursor = state.Cursor;
 pub const Engine = engine.Engine;
+pub const MouseEvent = input.MouseEvent;
+pub const MouseButton = input.MouseButton;
+pub const MouseEventKind = input.MouseEventKind;
 
 test {
     _ = @import("term/actions.zig");
@@ -33,6 +39,7 @@ test {
     _ = @import("term/state.zig");
     _ = @import("term/snapshot.zig");
     _ = @import("term/engine.zig");
+    _ = @import("term/input.zig");
     _ = @import("headless/runner.zig");
     _ = @import("headless/tests.zig");
 }
