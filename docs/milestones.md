@@ -7,8 +7,8 @@
 | 1 | Headless terminal core (text-only) | ✅ Done |
 | 2 | Action stream + parser skeleton | ✅ Done |
 | 3 | Minimal CSI support (cursor, erase, SGR) | ✅ Done |
-| 4 | Scroll + scrollback | Planned |
-| 5 | Alternate screen | Planned |
+| 4 | Scroll regions (DECSTBM) + IND/RI | ✅ Done |
+| 5 | Alternate screen + save/restore cursor + mode handling | ✅ Done |
 | 6 | Damage tracking | Planned |
 
 ---
@@ -152,3 +152,124 @@ programmatic attribute tests.
 **Tests added:** 33 new (81 total). Includes golden snapshot tests for all
 CSI commands, SGR attribute tests (direct cell inspection), and incremental
 parsing tests for CSI with parameters split across chunks.
+
+---
+
+## Milestone 4: Scroll Regions + IND/RI
+
+**Goal:** Implement DECSTBM scroll margins so that scrolling can be limited
+to a subset of rows. This is the mechanism TUI apps use to keep status bars
+fixed while content scrolls.
+
+**What was built:**
+
+- `scrollUpRegion(top, bottom)` and `scrollDownRegion(top, bottom)` on Grid.
+- `scroll_top` / `scroll_bottom` fields on TerminalState (0-based inclusive).
+- DECSTBM (`ESC[top;bottomr`) parsing and application.
+- Region-bounded scrolling: LF at region bottom scrolls only within the region.
+- Wrapping at region bottom also triggers region-bounded scroll.
+- `ESC D` (Index) — same as LF, scroll within region if at bottom margin.
+- `ESC M` (Reverse Index) — move up, scroll region down if at top margin.
+
+**Supported sequences added:**
+
+| Sequence | Name | Behavior |
+|----------|------|----------|
+| `ESC[{t};{b}r` | DECSTBM | Set scroll region (1-based, default = full screen) |
+| `ESC[r` | DECSTBM reset | Reset scroll region to full screen |
+| `ESC D` | IND (Index) | Move down; scroll within region if at bottom |
+| `ESC M` | RI (Reverse Index) | Move up; scroll region down if at top |
+
+**Key rules:**
+
+- Scroll regions only affect *scrolling* (LF at margin, wrap at margin, IND, RI).
+- Cursor movement (CUP, CUU/CUD) clamps to screen bounds, NOT to scroll region.
+- Invalid regions (top >= bottom after clamping) are silently ignored.
+- `scrollUp()` now delegates to `scrollUpRegion(0, rows-1)` for DRY.
+
+**Tests added:** 19 new (100 total). Covers region set/reset, invalid region
+rejection, LF within region, multiple scrolls, wrap-triggered region scroll,
+IND at region bottom, RI at region top, RI outside region, cursor movement
+outside region, and LF outside region.
+
+---
+
+## Milestone 5 — Alternate screen + save/restore cursor + mode handling
+
+**Goal:** Implement dual-buffer alternate screen, cursor save/restore, and DEC
+private mode parsing. This is the mechanism that makes `vim`, `htop`, `less`
+restore your original terminal contents on exit.
+
+### Sequences added
+
+| Sequence | Name | Action |
+|----------|------|--------|
+| `ESC[?1049h` | Enter alt screen | Switch to alt buffer, clear, cursor home |
+| `ESC[?1049l` | Leave alt screen | Switch back to main buffer, restore cursor |
+| `ESC[?47h/l` | Alt screen (legacy) | Treated equivalently to `?1049` |
+| `ESC[?1047h/l` | Alt screen (variant) | Treated equivalently to `?1049` |
+| `ESC 7` | DECSC | Save cursor + pen + scroll region |
+| `ESC 8` | DECRC | Restore cursor + pen + scroll region |
+| `CSI s` | Save cursor (ANSI) | Same as DECSC |
+| `CSI u` | Restore cursor (ANSI) | Same as DECRC |
+
+### Parser changes
+
+- DEC private mode sequences (`ESC[?...h` / `ESC[?...l`) are now recognized.
+  The `?` prefix byte is detected in the CSI buffer and routed to
+  `dispatchDecPrivate()`.
+- `ESC 7` and `ESC 8` are handled in `onEscape()`.
+- `CSI s` and `CSI u` are handled in `dispatchCsi()`.
+
+### Architecture: the swap-based dual buffer
+
+Instead of wrapping per-buffer state in a `BufferContext` struct (which would
+require rewriting every field access), we keep the flat layout:
+
+```
+TerminalState
+  grid, cursor, pen, scroll_top, scroll_bottom, saved_cursor   ← active
+  inactive_grid, inactive_cursor, inactive_pen, ...             ← stashed
+  alt_active: bool
+```
+
+`swapBuffers()` exchanges all 6 field pairs using `std.mem.swap`. This is
+zero-copy for grids (just swaps the slice headers, ~16 bytes each) and keeps
+all existing code (`printChar`, `cursorDown`, etc.) untouched — they naturally
+operate on whichever buffer is active.
+
+**Enter alt screen:**
+1. `swapBuffers()` — main state goes to inactive, alt state becomes active
+2. Clear the (now-active) alt grid, reset cursor to home, reset pen/scroll
+3. Set `alt_active = true`
+
+**Leave alt screen:**
+1. `swapBuffers()` — alt state goes to inactive, main state becomes active
+2. Set `alt_active = false`
+
+This preserves main buffer contents perfectly and costs zero allocations.
+
+### SavedCursor
+
+`SavedCursor` captures: cursor position, pen (SGR attributes), and scroll
+region bounds. It is stored per-buffer (swapped along with the rest), so
+save/restore in the alt screen does not affect the main screen's saved state.
+
+### Data model changes
+
+- `TerminalState` gained 7 new fields: `inactive_grid`, `inactive_cursor`,
+  `inactive_pen`, `inactive_scroll_top`, `inactive_scroll_bottom`,
+  `inactive_saved_cursor`, `alt_active`.
+- `SavedCursor` struct: `cursor`, `pen`, `scroll_top`, `scroll_bottom`.
+- `init()` now allocates two grids (with `errdefer` for safety).
+- `deinit()` frees both grids.
+
+### Action variants added
+
+`enter_alt_screen`, `leave_alt_screen`, `save_cursor`, `restore_cursor`.
+
+**Tests added:** 22 new (122 total). Covers alt screen preserving main,
+alt cleared on re-entry, `?47h`/`?1047h` variants, double-enter idempotency,
+cursor restore on leave, DECSC/DECRC golden test, CSI s/u golden test,
+save/restore pen attributes, per-buffer cursor isolation, save/restore
+scroll region capture, DEC private mode parsing, unsupported mode nop.

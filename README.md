@@ -43,9 +43,9 @@ Raw bytes ─▸ Parser ─▸ Action ─▸ State.apply() ─▸ Grid
 
 ### Key types
 
-- **`Action`** — tagged union (`print`, `control`, `nop`, `cursor_abs`, `cursor_rel`, `erase_display`, `erase_line`, `sgr`) — the vocabulary between parser and state.
-- **`Parser`** — incremental 3-state machine (ground → escape → CSI). Zero allocations, handles partial sequences across chunk boundaries.
-- **`TerminalState`** — grid + cursor + pen (current style). Mutates only via `apply(action)`.
+- **`Action`** — tagged union (16 variants: `print`, `control`, `nop`, `cursor_abs`, `cursor_rel`, `erase_display`, `erase_line`, `sgr`, `set_scroll_region`, `index`, `reverse_index`, `enter_alt_screen`, `leave_alt_screen`, `save_cursor`, `restore_cursor`) — the vocabulary between parser and state.
+- **`Parser`** — incremental 3-state machine (ground → escape → CSI). Zero allocations, handles partial sequences across chunk boundaries. Recognizes DEC private modes (`ESC[?...h/l`).
+- **`TerminalState`** — dual-buffer (main + alt) with per-buffer cursor, pen, scroll region, and saved cursor. Mutates only via `apply(action)`.
 - **`Engine`** — glue that connects parser and state with a simple `feed(bytes)` API.
 
 See [docs/architecture.md](docs/architecture.md) for the full breakdown.
@@ -76,13 +76,13 @@ The test suite uses **golden snapshot testing**: feed known bytes into a termina
 
 | What's tested | Count |
 |---------------|-------|
-| Grid operations (get/set, scroll, clear, style defaults) | 5 |
-| Parser state machine (ESC, CSI, dispatch, param parsing) | 18 |
-| State mutations (apply each action type) | 7 |
+| Grid operations (get/set, scroll, clear, region scroll, style) | 7 |
+| Parser state machine (ESC, CSI, dispatch, DEC private mode, save/restore) | 30 |
+| State mutations (apply each action type, scroll regions, alt screen, save/restore) | 12 |
 | Snapshot serialization | 2 |
 | Engine + runner integration | 3 |
-| Golden behavior + attribute tests (text, wrapping, cursor, erase, SGR, chunked) | 46 |
-| **Total** | **81** |
+| Golden + attribute tests (text, cursor, erase, SGR, regions, alt screen, save/restore) | 68 |
+| **Total** | **122** |
 
 See [docs/testing.md](docs/testing.md) for the full testing strategy.
 
@@ -97,8 +97,8 @@ Attyx is built milestone by milestone. Each milestone is stable and tested befor
 | 1 | Grid + cursor + printable text + control chars | ✅ Done |
 | 2 | Action stream + parser skeleton (ESC/CSI framing) | ✅ Done |
 | 3 | Minimal CSI support (cursor movement, erase, SGR 16 colors) | ✅ Done |
-| 4 | Scroll + scrollback buffer | 🔜 Next |
-| 5 | Alternate screen (`?1049h` / `?1049l`) | Planned |
+| 4 | Scroll regions (DECSTBM) + Index/Reverse Index | ✅ Done |
+| 5 | Alternate screen + save/restore cursor + mode handling | ✅ Done |
 | 6 | Damage tracking (dirty rows) | Planned |
 | 7 | PTY integration | Planned |
 | 8 | GPU rendering | Planned |

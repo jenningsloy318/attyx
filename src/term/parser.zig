@@ -69,6 +69,22 @@ pub const Parser = struct {
                 self.csi_len = 0;
                 return null;
             },
+            'D' => {
+                self.state = .ground;
+                return .index;
+            },
+            'M' => {
+                self.state = .ground;
+                return .reverse_index;
+            },
+            '7' => {
+                self.state = .ground;
+                return .save_cursor;
+            },
+            '8' => {
+                self.state = .ground;
+                return .restore_cursor;
+            },
             0x1B => {
                 return .nop;
             },
@@ -104,7 +120,14 @@ pub const Parser = struct {
     // -- CSI dispatch ------------------------------------------------------
 
     fn dispatchCsi(self: *Parser, final: u8) Action {
-        const params = parseCsiParams(self.csi_buf[0..self.csi_len]);
+        const buf = self.csi_buf[0..self.csi_len];
+
+        // DEC private mode: ESC[?...h / ESC[?...l
+        if (buf.len > 0 and buf[0] == '?') {
+            return dispatchDecPrivate(final, buf[1..]);
+        }
+
+        const params = parseCsiParams(buf);
         return switch (final) {
             'H', 'f' => makeCursorAbs(params),
             'A' => makeCursorRel(params, .up),
@@ -114,6 +137,9 @@ pub const Parser = struct {
             'J' => makeEraseDisplay(params),
             'K' => makeEraseLine(params),
             'm' => makeSgr(params),
+            'r' => makeSetScrollRegion(params),
+            's' => .save_cursor,
+            'u' => .restore_cursor,
             else => .nop,
         };
     }
@@ -211,6 +237,39 @@ fn makeSgr(params: CsiParams) Action {
     }
     sgr.len = count;
     return .{ .sgr = sgr };
+}
+
+/// DEC private mode dispatch (ESC[?...h / ESC[?...l).
+fn dispatchDecPrivate(final: u8, param_buf: []const u8) Action {
+    const params = parseCsiParams(param_buf);
+    return switch (final) {
+        'h' => makeDecSet(params),
+        'l' => makeDecReset(params),
+        else => .nop,
+    };
+}
+
+fn makeDecSet(params: CsiParams) Action {
+    if (params.len == 0) return .nop;
+    return switch (params.params[0]) {
+        47, 1047, 1049 => .enter_alt_screen,
+        else => .nop,
+    };
+}
+
+fn makeDecReset(params: CsiParams) Action {
+    if (params.len == 0) return .nop;
+    return switch (params.params[0]) {
+        47, 1047, 1049 => .leave_alt_screen,
+        else => .nop,
+    };
+}
+
+/// DECSTBM (ESC[top;bottom r) — carries raw 1-based values (0 = default).
+fn makeSetScrollRegion(params: CsiParams) Action {
+    const top: u16 = if (params.len > 0) params.params[0] else 0;
+    const bottom: u16 = if (params.len > 1) params.params[1] else 0;
+    return .{ .set_scroll_region = .{ .top = top, .bottom = bottom } };
 }
 
 // ---------------------------------------------------------------------------
@@ -408,4 +467,105 @@ test "unsupported CSI final byte returns nop" {
     _ = p.next(0x1B);
     _ = p.next('[');
     try std.testing.expectEqual(Action{ .nop = {} }, p.next('z').?);
+}
+
+test "CSI r dispatches set_scroll_region" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    _ = p.next('[');
+    _ = p.next('2');
+    _ = p.next(';');
+    _ = p.next('4');
+    const a = p.next('r').?;
+    try std.testing.expectEqual(Action{ .set_scroll_region = .{ .top = 2, .bottom = 4 } }, a);
+}
+
+test "CSI r with no params uses defaults (0,0)" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    _ = p.next('[');
+    const a = p.next('r').?;
+    try std.testing.expectEqual(Action{ .set_scroll_region = .{ .top = 0, .bottom = 0 } }, a);
+}
+
+test "ESC D produces index action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    const a = p.next('D').?;
+    try std.testing.expectEqual(Action.index, a);
+    try std.testing.expectEqual(Action{ .print = 'Z' }, p.next('Z').?);
+}
+
+test "ESC M produces reverse_index action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    const a = p.next('M').?;
+    try std.testing.expectEqual(Action.reverse_index, a);
+    try std.testing.expectEqual(Action{ .print = 'Z' }, p.next('Z').?);
+}
+
+test "ESC 7 produces save_cursor action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    try std.testing.expectEqual(Action.save_cursor, p.next('7').?);
+}
+
+test "ESC 8 produces restore_cursor action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    try std.testing.expectEqual(Action.restore_cursor, p.next('8').?);
+}
+
+test "CSI s produces save_cursor action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    _ = p.next('[');
+    try std.testing.expectEqual(Action.save_cursor, p.next('s').?);
+}
+
+test "CSI u produces restore_cursor action" {
+    var p: Parser = .{};
+    _ = p.next(0x1B);
+    _ = p.next('[');
+    try std.testing.expectEqual(Action.restore_cursor, p.next('u').?);
+}
+
+test "CSI ?1049h produces enter_alt_screen" {
+    var p: Parser = .{};
+    for ("\x1b[?1049h") |byte| _ = p.next(byte);
+    // Check via the tracing fields: final was 'h'
+    try std.testing.expectEqual(@as(u8, 'h'), p.csi_final);
+}
+
+test "CSI ?1049l produces leave_alt_screen" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b[?1049l") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    try std.testing.expectEqual(Action.leave_alt_screen, last.?);
+}
+
+test "CSI ?47h and ?1047h also produce enter_alt_screen" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b[?47h") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    try std.testing.expectEqual(Action.enter_alt_screen, last.?);
+
+    last = null;
+    for ("\x1b[?1047h") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    try std.testing.expectEqual(Action.enter_alt_screen, last.?);
+}
+
+test "CSI ?unsupported returns nop" {
+    var p: Parser = .{};
+    var last: ?Action = null;
+    for ("\x1b[?25h") |byte| {
+        if (p.next(byte)) |a| last = a;
+    }
+    try std.testing.expectEqual(Action.nop, last.?);
 }

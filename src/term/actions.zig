@@ -41,6 +41,13 @@ pub const Sgr = struct {
     len: u8 = 0,
 };
 
+/// Scroll region bounds (1-based, 0 = use default).
+/// The state converts to 0-based and validates.
+pub const ScrollRegion = struct {
+    top: u16 = 0,
+    bottom: u16 = 0,
+};
+
 /// A single terminal action produced by the parser.
 ///
 /// The parser converts raw bytes into Actions; TerminalState
@@ -62,4 +69,18 @@ pub const Action = union(enum) {
     erase_line: EraseMode,
     /// CSI m — select graphic rendition (colors, bold, underline).
     sgr: Sgr,
+    /// CSI r — DECSTBM: set top and bottom scroll margins.
+    set_scroll_region: ScrollRegion,
+    /// ESC D — Index: move cursor down, scroll within region if at bottom.
+    index,
+    /// ESC M — Reverse Index: move cursor up, scroll within region if at top.
+    reverse_index,
+    /// ESC[?1049h / ?47h / ?1047h — switch to alternate screen buffer.
+    enter_alt_screen,
+    /// ESC[?1049l / ?47l / ?1047l — switch back to main screen buffer.
+    leave_alt_screen,
+    /// ESC 7 / CSI s — save cursor position + attributes.
+    save_cursor,
+    /// ESC 8 / CSI u — restore cursor position + attributes.
+    restore_cursor,
 };

@@ -74,11 +74,11 @@ try expectEqual(Color.default, engine.state.grid.getCell(0, 1).style.fg);
 
 | Module | Tests |
 |--------|-------|
-| grid.zig | 5 |
-| parser.zig | 18 |
-| state.zig | 7 |
+| grid.zig | 7 |
+| parser.zig | 30 |
+| state.zig | 12 |
 | snapshot.zig | 2 |
 | engine.zig | 1 |
 | runner.zig | 2 |
-| tests.zig (golden + attr) | 46 |
-| **Total** | **81** |
+| tests.zig (golden + attr) | 68 |
+| **Total** | **122** |

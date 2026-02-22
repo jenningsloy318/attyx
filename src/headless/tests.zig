@@ -414,3 +414,308 @@ test "golden: CSI SGR split across chunks preserves color" {
     engine.feed("1mAB");
     try std.testing.expectEqual(Color.red, engine.state.grid.getCell(0, 0).style.fg);
 }
+
+// ===========================================================================
+// DECSTBM scroll regions (NEW in milestone 4)
+// ===========================================================================
+
+test "attr: scroll region set and reset" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 5, 6);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 4), engine.state.scroll_bottom);
+
+    engine.feed("\x1b[2;4r");
+    try std.testing.expectEqual(@as(usize, 1), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 3), engine.state.scroll_bottom);
+
+    engine.feed("\x1b[r");
+    try std.testing.expectEqual(@as(usize, 0), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 4), engine.state.scroll_bottom);
+}
+
+test "attr: invalid scroll region is ignored" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 5, 6);
+    defer engine.deinit();
+
+    engine.feed("\x1b[2;4r");
+    engine.feed("\x1b[4;2r"); // top > bottom → ignored
+    try std.testing.expectEqual(@as(usize, 1), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 3), engine.state.scroll_bottom);
+
+    engine.feed("\x1b[3;3r"); // top == bottom → ignored
+    try std.testing.expectEqual(@as(usize, 1), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 3), engine.state.scroll_bottom);
+}
+
+test "golden: LF at region bottom scrolls within region" {
+    // 5×6 grid, fill rows, set region 2..4 (1-based), LF at bottom of region.
+    // Rows outside region (0 and 4) must be untouched.
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[4;1H" ++
+        "\nX",
+        "AAAAA \n" ++
+        "CCCCC \n" ++
+        "DDDDD \n" ++
+        "X     \n" ++
+        "EEEEE \n");
+}
+
+test "golden: multiple LFs scroll within region repeatedly" {
+    try expectSnapshot(5, 4,
+        "AAA\r\nBBB\r\nCCC\r\nDDD\r\nEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[4;1H" ++
+        "\nX\r\nY",
+        "AAA \n" ++
+        "DDD \n" ++
+        "X   \n" ++
+        "Y   \n" ++
+        "EEE \n");
+}
+
+test "golden: wrap at region bottom triggers region scroll" {
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[4;5H" ++
+        "XY",
+        "AAAAA \n" ++
+        "CCCCC \n" ++
+        "DDDDXY\n" ++
+        "      \n" ++
+        "EEEEE \n");
+}
+
+test "golden: ESC[r resets scroll region to full screen" {
+    try expectSnapshot(3, 4,
+        "AAA\r\nBBB\r\nCCC" ++
+        "\x1b[2;3r" ++
+        "\x1b[r" ++
+        "\x1b[3;1H\n" ++
+        "X",
+        "BBB \n" ++
+        "CCC \n" ++
+        "X   \n");
+}
+
+test "golden: LF outside region does not trigger region scroll" {
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;3r" ++
+        "\x1b[5;1H\n",
+        "AAAAA \n" ++
+        "BBBBB \n" ++
+        "CCCCC \n" ++
+        "DDDDD \n" ++
+        "EEEEE \n");
+}
+
+test "golden: CUP moves cursor outside scroll region" {
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[1;1HX" ++
+        "\x1b[5;1HY",
+        "XAAAA \n" ++
+        "BBBBB \n" ++
+        "CCCCC \n" ++
+        "DDDDD \n" ++
+        "YEEEE \n");
+}
+
+// ===========================================================================
+// IND / RI — Index and Reverse Index (NEW in milestone 4)
+// ===========================================================================
+
+test "golden: IND at region bottom scrolls within region" {
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[4;1H" ++
+        "\x1bDX",
+        "AAAAA \n" ++
+        "CCCCC \n" ++
+        "DDDDD \n" ++
+        "X     \n" ++
+        "EEEEE \n");
+}
+
+test "golden: RI at region top scrolls down within region" {
+    try expectSnapshot(5, 6,
+        "AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE" ++
+        "\x1b[2;4r" ++
+        "\x1b[2;1H" ++
+        "\x1bMX",
+        "AAAAA \n" ++
+        "X     \n" ++
+        "BBBBB \n" ++
+        "CCCCC \n" ++
+        "EEEEE \n");
+}
+
+test "golden: RI outside region just moves cursor up" {
+    try expectSnapshot(3, 4,
+        "\x1b[2;3r" ++
+        "\x1b[3;1HA\r" ++
+        "\x1bMB",
+        "    \n" ++
+        "B   \n" ++
+        "A   \n");
+}
+
+// ===========================================================================
+// Alternate screen (NEW in milestone 5)
+// ===========================================================================
+
+test "golden: alt screen preserves main buffer" {
+    try expectSnapshot(2, 5,
+        "MAIN" ++
+        "\x1b[?1049h" ++
+        "ALT" ++
+        "\x1b[?1049l",
+        "MAIN \n" ++
+        "     \n");
+}
+
+test "golden: alt screen is cleared on each entry" {
+    try expectSnapshot(2, 5,
+        "\x1b[?1049h" ++
+        "ALT" ++
+        "\x1b[?1049l" ++
+        "\x1b[?1049h",
+        "     \n" ++
+        "     \n");
+}
+
+test "golden: alt screen with ?47h variant" {
+    try expectSnapshot(2, 5,
+        "MAIN" ++
+        "\x1b[?47h" ++
+        "ALT" ++
+        "\x1b[?47l",
+        "MAIN \n" ++
+        "     \n");
+}
+
+test "golden: alt screen with ?1047h variant" {
+    try expectSnapshot(2, 5,
+        "MAIN" ++
+        "\x1b[?1047h" ++
+        "ALT" ++
+        "\x1b[?1047l",
+        "MAIN \n" ++
+        "     \n");
+}
+
+test "golden: entering alt twice is idempotent" {
+    try expectSnapshot(2, 5,
+        "MAIN" ++
+        "\x1b[?1049h" ++
+        "\x1b[?1049h" ++
+        "ALT" ++
+        "\x1b[?1049l",
+        "MAIN \n" ++
+        "     \n");
+}
+
+test "attr: cursor restored when leaving alt screen" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 3, 5);
+    defer engine.deinit();
+
+    engine.feed("\x1b[2;3H");
+    try std.testing.expectEqual(@as(usize, 1), engine.state.cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), engine.state.cursor.col);
+
+    engine.feed("\x1b[?1049h");
+    try std.testing.expectEqual(@as(usize, 0), engine.state.cursor.row);
+    try std.testing.expectEqual(@as(usize, 0), engine.state.cursor.col);
+
+    engine.feed("\x1b[?1049l");
+    try std.testing.expectEqual(@as(usize, 1), engine.state.cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), engine.state.cursor.col);
+}
+
+// ===========================================================================
+// Cursor save / restore (NEW in milestone 5)
+// ===========================================================================
+
+test "golden: DECSC/DECRC save and restore cursor" {
+    try expectSnapshot(2, 5,
+        "AB" ++
+        "\x1b7" ++
+        "\x1b[2;4H" ++
+        "X" ++
+        "\x1b8" ++
+        "C",
+        "ABC  \n" ++
+        "   X \n");
+}
+
+test "golden: CSI s/u save and restore cursor" {
+    try expectSnapshot(2, 5,
+        "AB" ++
+        "\x1b[s" ++
+        "\x1b[2;4H" ++
+        "X" ++
+        "\x1b[u" ++
+        "C",
+        "ABC  \n" ++
+        "   X \n");
+}
+
+test "attr: save/restore preserves pen attributes" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 2, 5);
+    defer engine.deinit();
+
+    engine.feed("\x1b[31m");
+    engine.feed("\x1b7");
+    engine.feed("\x1b[0m");
+    engine.feed("\x1b8");
+    engine.feed("X");
+
+    try std.testing.expectEqual(Color.red, engine.state.grid.getCell(0, 0).style.fg);
+}
+
+test "attr: saved cursor is per-buffer" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 3, 5);
+    defer engine.deinit();
+
+    engine.feed("\x1b[2;3H");
+    engine.feed("\x1b7");
+
+    engine.feed("\x1b[?1049h");
+    engine.feed("\x1b[1;5H");
+    engine.feed("\x1b7");
+
+    engine.feed("\x1b[?1049l");
+    engine.feed("\x1b8");
+
+    try std.testing.expectEqual(@as(usize, 1), engine.state.cursor.row);
+    try std.testing.expectEqual(@as(usize, 2), engine.state.cursor.col);
+}
+
+test "attr: save/restore also captures scroll region" {
+    const alloc = std.testing.allocator;
+    var engine = try Engine.init(alloc, 5, 4);
+    defer engine.deinit();
+
+    engine.feed("\x1b[2;4r");
+    engine.feed("\x1b7");
+
+    engine.feed("\x1b[r");
+    try std.testing.expectEqual(@as(usize, 0), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 4), engine.state.scroll_bottom);
+
+    engine.feed("\x1b8");
+    try std.testing.expectEqual(@as(usize, 1), engine.state.scroll_top);
+    try std.testing.expectEqual(@as(usize, 3), engine.state.scroll_bottom);
+}

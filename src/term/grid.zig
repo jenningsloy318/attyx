@@ -70,16 +70,37 @@ pub const Grid = struct {
         @memset(self.cells[start .. start + self.cols], Cell{});
     }
 
-    /// Shift all rows up by one: row 1 becomes row 0, row 2 becomes row 1, etc.
-    /// The bottom row is cleared. The old top row is lost.
+    /// Shift all rows up by one (full-screen scroll).
     pub fn scrollUp(self: *Grid) void {
+        self.scrollUpRegion(0, self.rows - 1);
+    }
+
+    /// Scroll rows `top..bottom` up by one: row top+1 → top, top+2 → top+1, etc.
+    /// Row `bottom` is cleared. The old row `top` is lost.
+    /// Rows outside the region are untouched.
+    pub fn scrollUpRegion(self: *Grid, top: usize, bottom: usize) void {
+        if (top >= bottom) return;
         const stride = self.cols;
         std.mem.copyForwards(
             Cell,
-            self.cells[0 .. (self.rows - 1) * stride],
-            self.cells[stride .. self.rows * stride],
+            self.cells[top * stride .. bottom * stride],
+            self.cells[(top + 1) * stride .. (bottom + 1) * stride],
         );
-        self.clearRow(self.rows - 1);
+        self.clearRow(bottom);
+    }
+
+    /// Scroll rows `top..bottom` down by one: row bottom-1 → bottom, etc.
+    /// Row `top` is cleared. The old row `bottom` is lost.
+    /// Rows outside the region are untouched.
+    pub fn scrollDownRegion(self: *Grid, top: usize, bottom: usize) void {
+        if (top >= bottom) return;
+        const stride = self.cols;
+        std.mem.copyBackwards(
+            Cell,
+            self.cells[(top + 1) * stride .. (bottom + 1) * stride],
+            self.cells[top * stride .. bottom * stride],
+        );
+        self.clearRow(top);
     }
 };
 
@@ -135,6 +156,44 @@ test "scrollUp shifts rows and clears bottom" {
     try std.testing.expectEqual(@as(u8, 'B'), g.getCell(0, 0).char);
     try std.testing.expectEqual(@as(u8, 'C'), g.getCell(1, 0).char);
     try std.testing.expectEqual(@as(u8, ' '), g.getCell(2, 0).char);
+}
+
+test "scrollUpRegion shifts only within region" {
+    const alloc = std.testing.allocator;
+    var g = try Grid.init(alloc, 5, 2);
+    defer g.deinit();
+
+    g.setCell(0, 0, .{ .char = 'A' });
+    g.setCell(1, 0, .{ .char = 'B' });
+    g.setCell(2, 0, .{ .char = 'C' });
+    g.setCell(3, 0, .{ .char = 'D' });
+    g.setCell(4, 0, .{ .char = 'E' });
+    g.scrollUpRegion(1, 3);
+
+    try std.testing.expectEqual(@as(u8, 'A'), g.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u8, 'C'), g.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u8, 'D'), g.getCell(2, 0).char);
+    try std.testing.expectEqual(@as(u8, ' '), g.getCell(3, 0).char);
+    try std.testing.expectEqual(@as(u8, 'E'), g.getCell(4, 0).char);
+}
+
+test "scrollDownRegion shifts only within region" {
+    const alloc = std.testing.allocator;
+    var g = try Grid.init(alloc, 5, 2);
+    defer g.deinit();
+
+    g.setCell(0, 0, .{ .char = 'A' });
+    g.setCell(1, 0, .{ .char = 'B' });
+    g.setCell(2, 0, .{ .char = 'C' });
+    g.setCell(3, 0, .{ .char = 'D' });
+    g.setCell(4, 0, .{ .char = 'E' });
+    g.scrollDownRegion(1, 3);
+
+    try std.testing.expectEqual(@as(u8, 'A'), g.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u8, ' '), g.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u8, 'B'), g.getCell(2, 0).char);
+    try std.testing.expectEqual(@as(u8, 'C'), g.getCell(3, 0).char);
+    try std.testing.expectEqual(@as(u8, 'E'), g.getCell(4, 0).char);
 }
 
 test "new cells have default style" {
