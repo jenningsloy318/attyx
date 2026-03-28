@@ -85,19 +85,26 @@ GlyphCache createGlyphCache(FT_Library ft_lib, float contentScale) {
     free(fontPath);
 
     // Font size: prefer config (g_font_size), in points.
+    // Convert points to pixels: 1pt = 1/72 inch, standard desktop = 96 DPI,
+    // so px = pt * 96/72 * contentScale.  This matches how Ghostty, Kitty,
+    // and other terminals size fonts on Linux.
     float basePt = (g_font_size > 0) ? (float)g_font_size : 14.0f;
-    int fontSize = (int)(basePt * contentScale);
+    int fontSize = (int)(basePt * contentScale * 96.0f / 72.0f + 0.5f);
     FT_Set_Pixel_Sizes(face, 0, fontSize);
 
-    float ascender = (float)(face->size->metrics.ascender >> 6);
-    float naturalH = (float)(face->size->metrics.height >> 6);
+    // Use /64.0f (not >>6) to preserve sub-pixel precision from FreeType's
+    // 26.6 fixed-point metrics.  At small font sizes (e.g. 8pt) the fractional
+    // part matters — truncation can shift glyphs by a full pixel and produce
+    // wrong cell dimensions when percentage overrides are applied.
+    float ascender = face->size->metrics.ascender / 64.0f;
+    float naturalH = face->size->metrics.height / 64.0f;
 
     // Measure actual monospace cell width from a reference ASCII glyph.
     float naturalW;
     if (FT_Load_Char(face, 'M', FT_LOAD_DEFAULT) == 0) {
-        naturalW = (float)(face->glyph->advance.x >> 6);
+        naturalW = face->glyph->advance.x / 64.0f;
     } else {
-        naturalW = (float)(face->size->metrics.max_advance >> 6);
+        naturalW = face->size->metrics.max_advance / 64.0f;
     }
     float gh = naturalH;
     float gw = naturalW;
@@ -116,6 +123,16 @@ GlyphCache createGlyphCache(FT_Library ft_lib, float contentScale) {
 
     float baseline_y_offset = (gh - naturalH) / 2.0f;
     float x_offset = (gw - naturalW) / 2.0f;
+
+    ATTYX_LOG_INFO("glyph", "font: base=%.0fpt scale=%.2f fontSize=%dpx",
+        basePt, contentScale, fontSize);
+    ATTYX_LOG_INFO("glyph", "font: ascender=%.2f height=%.2f advance=%.2f (raw 26.6: asc=%ld h=%ld adv=%ld)",
+        ascender, naturalH, naturalW,
+        face->size->metrics.ascender, face->size->metrics.height,
+        FT_Load_Char(face, 'M', FT_LOAD_DEFAULT) == 0 ? face->glyph->advance.x : face->size->metrics.max_advance);
+    ATTYX_LOG_INFO("glyph", "font: cell_w_cfg=%d cell_h_cfg=%d -> gw=%.1f gh=%.1f",
+        g_cell_width, g_cell_height, gw, gh);
+    ATTYX_LOG_INFO("glyph", "font: baseline_y_off=%.2f x_off=%.2f", baseline_y_offset, x_offset);
 
     int cols = 32;
     int initRows = 32;
