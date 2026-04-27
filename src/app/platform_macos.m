@@ -539,6 +539,40 @@ void attyx_spawn_new_window(void) {
     return frameSize;
 }
 
+// When the window moves to a screen with a different backing scale, the glyph
+// cache must be rasterized at the new scale, and the window may need to be
+// fit into the new screen's visibleFrame (a window sized for a larger display
+// would otherwise extend off-screen on a smaller one).
+- (void)fitWindowToCurrentScreen {
+    NSScreen* screen = _window.screen;
+    if (!screen) return;
+    NSRect vf = screen.visibleFrame;
+    NSRect wf = _window.frame;
+    CGFloat w = MIN(wf.size.width,  vf.size.width);
+    CGFloat h = MIN(wf.size.height, vf.size.height);
+    CGFloat x = wf.origin.x;
+    CGFloat y = wf.origin.y;
+    if (x < vf.origin.x) x = vf.origin.x;
+    if (y < vf.origin.y) y = vf.origin.y;
+    if (x + w > vf.origin.x + vf.size.width)  x = vf.origin.x + vf.size.width  - w;
+    if (y + h > vf.origin.y + vf.size.height) y = vf.origin.y + vf.size.height - h;
+    NSRect nf = NSMakeRect(x, y, w, h);
+    if (!NSEqualRects(nf, wf)) {
+        [_window setFrame:nf display:YES animate:NO];
+    }
+}
+
+- (void)windowDidChangeScreen:(NSNotification*)notification {
+    (void)notification;
+    [self fitWindowToCurrentScreen];
+    g_needs_font_rebuild = 1;
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification*)notification {
+    (void)notification;
+    g_needs_font_rebuild = 1;
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
     return YES;
 }

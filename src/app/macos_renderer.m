@@ -202,7 +202,8 @@ int emitString(Vertex* v, int i, GlyphCache* gc,
     if (_glyphCache.font_italic) CFRelease(_glyphCache.font_italic);
     if (_glyphCache.font_bold_italic) CFRelease(_glyphCache.font_bold_italic);
 
-    CGFloat scale = [NSScreen mainScreen].backingScaleFactor;
+    NSScreen* screen = view.window.screen ?: [NSScreen mainScreen];
+    CGFloat scale = screen.backingScaleFactor;
     _glyphCache = createGlyphCache(_device, scale);
     ligatureCacheClear();
 
