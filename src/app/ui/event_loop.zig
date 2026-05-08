@@ -327,7 +327,19 @@ pub fn ptyReaderThread(ctx: *PtyThreadCtx) void {
             for (ctx.active_theme.palette, 0..) |opt_color, i| {
                 if (opt_color) |p| sb.ansi_palette[i] = .{ .r = p.r, .g = p.g, .b = p.b };
             }
-            statusbar_refreshed = sb.tick(std.time.timestamp(), publish.ctxPty(ctx).master, publish.ctxEngine(ctx).state.working_directory);
+            // SSR-mode panes don't populate engine.state.working_directory
+            // because the daemon owns the parser. Fall back to the daemon's
+            // fg_cwd notification (raw path) and present it as a file:// URI
+            // so the widget paths (which expect URIs) handle it uniformly.
+            const sb_pane = ctx.tab_mgr.activePane();
+            var sb_cwd_buf: [@import("../statusbar.zig").max_output_len]u8 = undefined;
+            const sb_cwd: ?[]const u8 = blk: {
+                if (sb_pane.engine.state.working_directory) |uri| break :blk uri;
+                if (sb_pane.daemon_fg_cwd_len == 0) break :blk null;
+                const path = sb_pane.daemon_fg_cwd[0..sb_pane.daemon_fg_cwd_len];
+                break :blk std.fmt.bufPrint(&sb_cwd_buf, "file://{s}", .{path}) catch null;
+            };
+            statusbar_refreshed = sb.tick(std.time.timestamp(), publish.ctxPty(ctx).master, sb_cwd);
         };
 
         // Debug overlay toggle check
@@ -1777,6 +1789,12 @@ fn applyGridSnapshot(ctx: *PtyThreadCtx, payload: []const u8) ?GridApplyResult {
     result.pane.engine.state.cursor_visible = info.cursor_visible;
     result.pane.engine.state.cursor_shape = @enumFromInt(info.cursor_shape);
     result.pane.engine.state.alt_active = info.alt_active;
+    // Mouse mode propagation: in grid-sync the client engine never sees
+    // DECSET 1000/1002/1003/1006, so without this the client thinks the
+    // app isn't tracking mouse and consumes click-drag as native selection
+    // — preventing TUIs (claude code, opencode) from receiving mouse input.
+    result.pane.engine.state.mouse_tracking = @enumFromInt(info.mouse_tracking);
+    result.pane.engine.state.mouse_sgr = info.mouse_sgr;
     return .{ .final_chunk = info.final_chunk, .tab_idx = result.tab_idx, .pane_id = info.pane_id };
 }
 
